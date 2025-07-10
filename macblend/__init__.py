@@ -156,7 +156,10 @@ def get_pixel_coords(norm_coords, image_width, image_height):
         if image_width <= 0 or image_height <= 0:
             return None
         px = norm_coords.x * image_width
-        py = (1.0 - norm_coords.y) * image_height
+        # The console output shows a perfect vertical flip. The only place a Y-flip
+        # occurs is here. Based on the sampling results, we should not be flipping
+        # the Y-coordinate.
+        py = norm_coords.y * image_height
         px_clamped = max(0, min(image_width - 1, px))
         py_clamped = max(0, min(image_height - 1, py))
         return int(round(px_clamped)), int(round(py_clamped))
@@ -206,7 +209,7 @@ def load_and_get_nodegroup(group_name="ColorMatrix"):
 def update_marker_geometry(scene):
     """
     Updates the geometry of the shared marker curve based on the 'sample_size'
-    percentage and the current dimensions of the control rig.
+    percentage and the current dimensions and rotation of the control rig.
     """
     if not scene or not hasattr(scene, 'macbeth_calibrator_settings'):
         return
@@ -229,36 +232,50 @@ def update_marker_geometry(scene):
     p_bl = corner_bl.matrix_world.translation
     p_br = corner_br.matrix_world.translation
 
-    avg_top_width = (p_tr - p_tl).length
-    avg_bot_width = (p_br - p_bl).length
-    cell_width = ((avg_top_width + avg_bot_width) / 2) / 6
+    # Calculate edge vectors and average lengths
+    top_vec = p_tr - p_tl
+    left_vec = p_bl - p_tl
+    
+    avg_width = (top_vec.length + (p_br - p_bl).length) / 2.0
+    avg_height = (left_vec.length + (p_br - p_tr).length) / 2.0
 
-    avg_left_height = (p_tl - p_bl).length
-    avg_right_height = (p_tr - p_br).length
-    cell_height = ((avg_left_height + avg_right_height) / 2) / 4
-
+    cell_width = avg_width / 6.0
+    cell_height = avg_height / 4.0
+    
     max_radius = 0.5 * min(cell_width, cell_height)
-    # 'radius' here is used as half the side length of the square
     half_side = max_radius * (settings.sample_size / 100.0)
 
+    # Construct a rotation matrix from the rig's edge vectors
+    x_axis = top_vec.normalized()
+    y_axis = left_vec.normalized()
+    z_axis = x_axis.cross(y_axis).normalized()
+    # Create a new y_axis perpendicular to x and z for a clean orthonormal matrix
+    y_axis_perp = z_axis.cross(x_axis).normalized()
+    
+    # Final rotation matrix for the rig
+    rot_matrix = mathutils.Matrix((x_axis, y_axis_perp, z_axis)).transposed()
+
     # Define vertices for an axis-aligned square
-    points_co = [
-        (-half_side, -half_side, 0),
-        ( half_side, -half_side, 0),
-        ( half_side,  half_side, 0),
-        (-half_side,  half_side, 0),
+    points_co_local = [
+        mathutils.Vector((-half_side, -half_side, 0)),
+        mathutils.Vector(( half_side, -half_side, 0)),
+        mathutils.Vector(( half_side,  half_side, 0)),
+        mathutils.Vector((-half_side,  half_side, 0)),
     ]
+    
+    # Rotate the local square vertices by the rig's rotation matrix
+    points_co_rotated = [rot_matrix @ p for p in points_co_local]
     
     spline = marker_curve.splines[0]
     
-    # Set the coordinates and handle types for each point to form a square
+    # Set the coordinates and handle types for each point to form a rotated square
     for i, p in enumerate(spline.bezier_points):
-        p.co = points_co[i]
-        p.handle_left = points_co[i]
-        p.handle_right = points_co[i]
+        p.co = points_co_rotated[i]
+        p.handle_left = points_co_rotated[i]
+        p.handle_right = points_co_rotated[i]
         p.handle_left_type = 'VECTOR'
         p.handle_right_type = 'VECTOR'
-    
+
 def update_marker_positions(scene):
     """
     Calculates and sets the positions of the 24 sample markers based on the
@@ -284,10 +301,16 @@ def update_marker_positions(scene):
     if not marker_collection:
         return
 
-    # Get the sample markers, sorted by name to ensure consistent order
-    markers = sorted([obj for obj in marker_collection.objects if obj.name.startswith("MB_Sample_")], key=lambda o: o.name)
+    # Get the sample markers and sort them numerically to ensure correct order.
+    markers = [obj for obj in marker_collection.objects if obj.name.startswith("MB_Sample_")]
     if len(markers) != 24:
         return
+    try:
+        markers.sort(key=lambda obj: int(obj.name.split('_')[2]))
+    except (IndexError, ValueError):
+        # This can happen if the rig is cleared and this function runs before it's fully rebuilt.
+        return
+
 
     # Get the world-space locations of the corner controllers
     p_tl = corner_tl.matrix_world.translation
@@ -299,20 +322,22 @@ def update_marker_positions(scene):
     num_rows = 4
     patch_index = 0
 
-    # Iterate through each row and column of the grid
+    # Iterate through each row and column of the grid.
+    # The corner controllers are expected to be on the outer corners of the chart.
+    # The interpolation is adjusted to find the center of each patch.
     for r in range(num_rows):
-        # Vertical interpolation factor (0.0 for bottom row, 1.0 for top row)
-        v = r / (num_rows - 1) if num_rows > 1 else 0
+        # Calculate v to find the vertical center of the current row's area.
+        v = (r + 0.5) / num_rows
         
-        # Interpolate to find the start and end points of the current row
-        p_left = p_bl.lerp(p_tl, v)
-        p_right = p_br.lerp(p_tr, v)
+        # Interpolate the left and right edges of the current row.
+        p_left = p_tl.lerp(p_bl, v)
+        p_right = p_tr.lerp(p_br, v)
 
         for c in range(num_cols):
-            # Horizontal interpolation factor (0.0 for left col, 1.0 for right col)
-            u = c / (num_cols - 1) if num_cols > 1 else 0
+            # Calculate u to find the horizontal center of the current column's area.
+            u = (c + 0.5) / num_cols
             
-            # Interpolate across the row to find the marker's final position
+            # Interpolate across the row to find the marker's final position at the patch center.
             pos = p_left.lerp(p_right, u)
 
             if patch_index < len(markers):
@@ -538,15 +563,22 @@ class MB_OT_SetupSampleMarkers(bpy.types.Operator):
         scene = context.scene
         view_layer = context.view_layer
         settings = scene.macbeth_calibrator_settings
-        settings.marker_collection_name = self.collection_name
+        
+        base_name = "Macbeth Control Rig"
+        image_name_part = ""
+        if settings.image and settings.image.name:
+            image_name_part = f" ({settings.image.name})"
+        
+        final_collection_name = f"{base_name}{image_name_part}"
+        settings.marker_collection_name = final_collection_name
 
-        rig_collection = bpy.data.collections.get(self.collection_name)
+        rig_collection = bpy.data.collections.get(final_collection_name)
         if not rig_collection:
-            rig_collection = bpy.data.collections.new(self.collection_name)
+            rig_collection = bpy.data.collections.new(final_collection_name)
             scene.collection.children.link(rig_collection)
-            print(f"Created collection: '{self.collection_name}'")
+            print(f"Created collection: '{final_collection_name}'")
         else:
-            print(f"Found existing collection: '{self.collection_name}'")
+            print(f"Found existing collection: '{final_collection_name}'")
             objects_to_delete = [obj for obj in rig_collection.objects]
             for obj in objects_to_delete:
                     bpy.data.objects.remove(obj, do_unlink=True)
@@ -628,7 +660,7 @@ class MB_OT_SetupSampleMarkers(bpy.types.Operator):
             if original_active and original_active.name in view_layer.objects:
                 view_layer.objects.active = original_active
 
-        self.report({'INFO'}, f"Created control rig in collection '{self.collection_name}'.")
+        self.report({'INFO'}, f"Created control rig in collection '{final_collection_name}'.")
         return {'FINISHED'}
 
 class MB_OT_SetBackground(bpy.types.Operator):
@@ -782,6 +814,38 @@ class MB_OT_ApplyToCompositor(bpy.types.Operator):
         scene = context.scene
         return scene and scene.use_nodes and hasattr(scene, 'macbeth_calibrator_settings')
 
+    def _create_or_update_matrix_node(self, context, tree, node_name, matrix, location, group_definition):
+        """Helper to create or update a single ColorMatrix node group instance."""
+        # Flatten matrix for node inputs
+        matrix_values = [item for row in matrix for item in row]
+
+        node = tree.nodes.get(node_name)
+        if node and node.bl_idname != 'CompositorNodeGroup':
+            tree.nodes.remove(node)
+            node = None
+        
+        if not node:
+            node = tree.nodes.new(type='CompositorNodeGroup')
+            node.name = node_name
+            node.label = node_name
+            node.location = location
+        
+        node.node_tree = group_definition
+        
+        context.view_layer.update()
+        
+        try:
+            if 'Output Red' in node.inputs:
+                node.inputs['Output Red'].default_value = (matrix_values[0], matrix_values[1], matrix_values[2])
+            if 'Output Green' in node.inputs:
+                node.inputs['Output Green'].default_value = (matrix_values[3], matrix_values[4], matrix_values[5])
+            if 'Output Blue' in node.inputs:
+                node.inputs['Output Blue'].default_value = (matrix_values[6], matrix_values[7], matrix_values[8])
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to set matrix on '{node.name}': {e}")
+            traceback.print_exc()
+
+
     def execute(self, context):
         if not _dependencies_met:
             self.report({'ERROR'}, "NumPy dependency is not met. Please check console for errors.")
@@ -793,73 +857,53 @@ class MB_OT_ApplyToCompositor(bpy.types.Operator):
             self.report({'ERROR'}, "Addon settings not found.")
             return {'CANCELLED'}
         
-        # Ensure the compositor is enabled
         if not scene.use_nodes:
             scene.use_nodes = True
             self.report({'INFO'}, "Compositor Nodes enabled.")
         
-        # This should not happen if use_nodes is true, but as a safeguard:
         if not scene.node_tree:
             self.report({'ERROR'}, "Scene has no compositor node tree.")
             return {'CANCELLED'}
 
-        node_name_to_use = settings.node_name
+        # Get the base and inverse node names from settings
+        forward_node_name = settings.node_name
+        inverse_node_name = f"{forward_node_name}_Inverse"
 
-        matrix_to_apply = None
+        forward_matrix = mathutils.Matrix.Identity(3)
+        inverse_matrix = mathutils.Matrix.Identity(3)
+
         if not settings.calculation_done:
-            self.report({'WARNING'}, "Matrix not calculated. Applying identity matrix.")
-            matrix_to_apply = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+            self.report({'WARNING'}, "Matrix not calculated. Applying identity matrices.")
         else:
-            # The property returns a mathutils.Matrix object, which needs to be flattened into a list.
-            m = settings.calculated_matrix
-            matrix_to_apply = [item for row in m for item in row]
+            forward_matrix = settings.calculated_matrix.copy()
+            inverse_matrix = forward_matrix.copy()
+            try:
+                inverse_matrix.invert()
+            except ValueError:
+                self.report({'WARNING'}, "Matrix is not invertible. Using identity for inverse.")
+                inverse_matrix = mathutils.Matrix.Identity(3)
 
         tree = scene.node_tree
         
-        # Get or create the node instance
-        node = tree.nodes.get(node_name_to_use)
-        
-        # If a node with the name exists but is not a group, remove it.
-        if node and node.bl_idname != 'CompositorNodeGroup':
-            tree.nodes.remove(node)
-            node = None
-        
-        if not node:
-            node = tree.nodes.new(type='CompositorNodeGroup')
-            node.name = node_name_to_use
-            node.label = node_name_to_use
-            # Place new nodes at a reasonable position
-            render_layers = tree.nodes.get('Render Layers')
-            if render_layers:
-                node.location = (render_layers.location.x + 300, render_layers.location.y)
-            else:
-                node.location = (200, 400)
-
-        # Get or create the underlying node group (the definition)
         color_matrix_group = load_and_get_nodegroup()
         if not color_matrix_group:
             self.report({'ERROR'}, "Failed to load 'ColorMatrix' node group. Check console.")
             return {'CANCELLED'}
-
-        node.node_tree = color_matrix_group
         
-        # Force a dependency graph update to ensure the node's sockets are available
-        context.view_layer.update()
+        # Determine node locations
+        render_layers = tree.nodes.get('Render Layers')
+        if render_layers:
+            base_location = (render_layers.location.x + 350, render_layers.location.y)
+        else:
+            base_location = (200, 400)
         
-        # Set the matrix values on the node's inputs
-        try:
-            if 'Output Red' in node.inputs:
-                node.inputs['Output Red'].default_value = (matrix_to_apply[0], matrix_to_apply[1], matrix_to_apply[2])
-            if 'Output Green' in node.inputs:
-                node.inputs['Output Green'].default_value = (matrix_to_apply[3], matrix_to_apply[4], matrix_to_apply[5])
-            if 'Output Blue' in node.inputs:
-                node.inputs['Output Blue'].default_value = (matrix_to_apply[6], matrix_to_apply[7], matrix_to_apply[8])
-            self.report({'INFO'}, f"Applied matrix to group node '{node.name}'.")
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to set matrix on group node '{node.name}': {e}")
-            traceback.print_exc()
-            return {'CANCELLED'}
+        inverse_location = (base_location[0], base_location[1] - 200)
 
+        # Create/update the forward and inverse nodes
+        self._create_or_update_matrix_node(context, tree, forward_node_name, forward_matrix, base_location, color_matrix_group)
+        self._create_or_update_matrix_node(context, tree, inverse_node_name, inverse_matrix, inverse_location, color_matrix_group)
+
+        self.report({'INFO'}, f"Set matrix for '{forward_node_name}' and '{inverse_node_name}'.")
         return {'FINISHED'}
 
 # --- UI Panel ---

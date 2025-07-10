@@ -60,12 +60,11 @@ def sample_image_color(image, px, py, sample_size):
         sample_region = pixels_np[y_start:y_end, x_start:x_end, :3]
         if sample_region.size > 0:
             average_color = np.mean(sample_region, axis=(0, 1))
-            average_color_clamped = np.maximum(0.0, average_color)
-            return tuple(average_color_clamped)
+            return tuple(average_color)
         else:
             safe_py = max(0, min(height - 1, py))
             safe_px = max(0, min(width - 1, px))
-            return tuple(np.maximum(0.0, pixels_np[safe_py, safe_px, :3]))
+            return tuple(pixels_np[safe_py, safe_px, :3])
     except Exception as e:
         print(f"Error sampling region at ({px},{py}): {e}")
         return fallback_color
@@ -131,9 +130,19 @@ def run_calculation(context, operator, helpers):
         marker_collection = helpers['bpy'].data.collections.get(collection_name)
         if not marker_collection:
             raise ValueError(f"Marker collection '{collection_name}' not found.")
-        markers = sorted([o for o in marker_collection.objects if o.name.startswith("MB_Sample_")], key=lambda obj: obj.name)
+        
+        markers = [o for o in marker_collection.objects if o.name.startswith("MB_Sample_")]
+
         if len(markers) < 24:
             raise ValueError(f"Expected 24 markers, found {len(markers)}.")
+
+        # Sort markers numerically based on the number in their name (e.g., 'MB_Sample_01_dark_skin').
+        # This ensures the sample order matches the reference swatch order.
+        try:
+            markers.sort(key=lambda obj: int(obj.name.split('_')[2]))
+        except (IndexError, ValueError) as e:
+            raise ValueError(f"Could not sort markers by name. Check naming convention. Error: {e}")
+
         markers = markers[:24]
         if not img or not img.has_data:
             raise ValueError("Input Image not set or has no data.")
@@ -229,14 +238,14 @@ def run_calculation(context, operator, helpers):
                 print(f"        --> WARNING: Invalid pixel coordinates for patch {i + 1}.")
                 linear_color_rgb = (0.0, 0.0, 0.0)
             else:
-                px, py = coords
+                px, py = coords              
                 sampled_color_rgb = sample_image_color(img, px, py, current_sample_size)
                 if sampled_color_rgb is None or not isinstance(sampled_color_rgb, (tuple, list)) or len(sampled_color_rgb) != 3:
                     print(f"        --> WARNING: Invalid sample patch {i + 1}.")
                     linear_color_rgb = (0.0, 0.0, 0.0)
                 else:
                     if raw_set_successfully:
-                        linear_color_rgb = tuple(max(0.0, val) for val in sampled_color_rgb)
+                        linear_color_rgb = sampled_color_rgb
                     else:
                         try:
                             clamped_color = tuple(max(0.0, min(1.0, val)) for val in sampled_color_rgb)
