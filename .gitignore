@@ -220,4 +220,5 @@ vcs.xml
 workspace.xml
 profiles_settings.xml
 
-
+.vscode/
+.idea/
