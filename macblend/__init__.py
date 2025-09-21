@@ -5,18 +5,6 @@ import sys
 print(f"DEBUG: Module name is: {__name__}")
 print(f"DEBUG: Module file is: {__file__}")
 
-bl_info = {
-    "name": "Macbeth Calibrator 3D",
-    "author": "Manuel Houben",
-    "version": (1, 5, 1),
-    "blender": (4, 0, 0),
-    "location": "View3D > Sidebar > Macbeth Tab",
-    "description": ("Calculates a color matrix using a Macbeth chart."),
-    "warning": "Requires NumPy. The addon will attempt to install it automatically.",
-    "doc_url": "",
-    "category": "Color",
-}
-
 # --- Imports ---
 import bpy
 from bpy_extras import object_utils
@@ -28,6 +16,9 @@ import os
 import mathutils
 import subprocess
 import importlib
+from bpy_extras.io_utils import ExportHelper
+
+from . import core
 
 # Import property types directly for Blender 4.x compatibility
 from bpy.props import (
@@ -38,63 +29,6 @@ from bpy.props import (
     PointerProperty,
     EnumProperty
 )
-
-# --- Dependency Management ---
-_dependencies_met = False
-core = None
-
-def install_dependency(package_name):
-    """Attempts to install a package using pip."""
-    py_exec = sys.executable
-    print(f"Attempting to install '{package_name}' using pip for Python at: {py_exec}")
-    try:
-        process = subprocess.Popen(
-            [py_exec, "-m", "pip", "install", package_name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        stdout, stderr = process.communicate()
-        if process.returncode == 0:
-            print(f"'{package_name}' installed successfully.")
-            return True
-        else:
-            print(f"pip installation failed for '{package_name}'.")
-            print("--- pip stdout ---")
-            print(stdout)
-            print("--- pip stderr ---")
-            print(stderr)
-            return False
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"An error occurred while trying to install '{package_name}': {e}")
-        return False
-
-def check_dependencies():
-    """
-    Checks if all required dependencies are met. If not, attempts to install them.
-    Returns True if dependencies are met, False otherwise.
-    """
-    global _dependencies_met
-    if _dependencies_met:
-        return True
-
-    try:
-        importlib.import_module("numpy")
-        _dependencies_met = True
-        return True
-    except ImportError:
-        print("NumPy not found. Attempting installation...")
-        if install_dependency("numpy"):
-            try:
-                importlib.invalidate_caches()
-                importlib.import_module("numpy")
-                _dependencies_met = True
-                return True
-            except ImportError:
-                print("Failed to import NumPy even after a supposedly successful installation.")
-                return False
-        else:
-            return False
 
 # --- Constants ---
 MACBETH_PATCH_NAMES = ["dark skin", "light skin", "blue sky", "foliage", "blue flower", "bluish green", "orange", "purplish blue", "moderate red", "purple", "yellow green", "orange yellow", "blue", "green", "red", "yellow", "magenta", "cyan", "white 9.5", "neutral 8", "neutral 6.5", "neutral 5", "neutral 3.5", "black 2"]
@@ -117,7 +51,7 @@ def linearize_color(rgb_tuple):
 
 def load_json_data(context):
     """Loads colorspace transform data from JSON specified in preferences, or defaults to bundled file."""
-    prefs = context.preferences.addons["macblend"].preferences
+    prefs = context.preferences.addons[__package__].preferences
     if hasattr(prefs, 'get_effective_json_path'):
         json_path = prefs.get_effective_json_path()
     else:
@@ -402,7 +336,7 @@ def get_target_colorspace_items(self, context):
 
     json_path = None
     try:
-        prefs_addon = context.preferences.addons.get("macblend")
+        prefs_addon = context.preferences.addons.get(__package__)
         if prefs_addon:
             addon_prefs = prefs_addon.preferences
             if addon_prefs:
@@ -438,7 +372,7 @@ def get_target_colorspace_items(self, context):
 
 # --- Classes ---
 class MacbethCalibratorPreferences(bpy.types.AddonPreferences):
-    bl_idname = "macblend"
+    bl_idname = __package__
     
     json_file_path: StringProperty(
         name="Colorspace JSON File",
@@ -784,10 +718,6 @@ class MB_OT_CalculateMatrix(bpy.types.Operator):
         return True
 
     def execute(self, context):
-        if core is None:
-            self.report({'ERROR'}, "Core module not loaded. Please restart Blender or re-install the addon.")
-            return {'CANCELLED'}
-
         # This dictionary passes non-numpy-dependent helper functions and data
         # to the core module to avoid circular imports.
         helpers = {
@@ -836,21 +766,17 @@ class MB_OT_ApplyToCompositor(bpy.types.Operator):
         
         try:
             if 'Output Red' in node.inputs:
-                node.inputs['Output Red'].default_value = (matrix_values[0], matrix_values[1], matrix_values[2])
+                node.inputs['Output Red'].default_value = (matrix_values[0], matrix_values[3], matrix_values[6])
             if 'Output Green' in node.inputs:
-                node.inputs['Output Green'].default_value = (matrix_values[3], matrix_values[4], matrix_values[5])
+                node.inputs['Output Green'].default_value = (matrix_values[1], matrix_values[4], matrix_values[7])
             if 'Output Blue' in node.inputs:
-                node.inputs['Output Blue'].default_value = (matrix_values[6], matrix_values[7], matrix_values[8])
+                node.inputs['Output Blue'].default_value = (matrix_values[2], matrix_values[5], matrix_values[8])
         except Exception as e:
             self.report({'ERROR'}, f"Failed to set matrix on '{node.name}': {e}")
             traceback.print_exc()
 
 
     def execute(self, context):
-        if not _dependencies_met:
-            self.report({'ERROR'}, "NumPy dependency is not met. Please check console for errors.")
-            return {'CANCELLED'}
-
         settings = context.scene.macbeth_calibrator_settings
         scene = context.scene
         if not settings:
@@ -906,6 +832,69 @@ class MB_OT_ApplyToCompositor(bpy.types.Operator):
         self.report({'INFO'}, f"Set matrix for '{forward_node_name}' and '{inverse_node_name}'.")
         return {'FINISHED'}
 
+class MB_OT_ExportCLF(bpy.types.Operator, ExportHelper):
+    """Exports the calculated matrix to a Common LUT Format (.clf) file"""
+    bl_idname = "mbcalib.export_clf"
+    bl_label = "Export Matrix as CLF"
+    bl_options = {'REGISTER'}
+
+    filename_ext = ".clf"
+    filter_glob: StringProperty(
+        default="*.clf",
+        options={'HIDDEN'},
+        maxlen=255,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        if not context or not context.scene or not hasattr(context.scene, 'macbeth_calibrator_settings'):
+            return False
+        settings = context.scene.macbeth_calibrator_settings
+        return settings and settings.calculation_done
+
+    def execute(self, context):
+        settings = context.scene.macbeth_calibrator_settings
+        
+        # The FloatVectorProperty with subtype='MATRIX' returns a mathutils.Matrix object.
+        # We must flatten this 3x3 matrix into a single list of 9 floats
+        # for the f-string formatting to work correctly.
+        matrix = settings.calculated_matrix
+        m_flat = [value for row in matrix for value in row]
+        
+        process_id = settings.node_name if settings.node_name else "MacbethCalibratorExport"
+
+        # The core logic assumes input is the scene-linear space, which in a default
+        # Blender setup is Linear sRGB (with Rec.709 primaries). The CLF file
+        # must accurately describe this transform.
+        input_desc = "Linear Rec.709 (sRGB)"
+        output_desc = settings.target_colorspace
+        if output_desc == 'LINEAR_SRGB_D65':
+             output_desc = "Linear Rec.709 (sRGB)"
+
+        clf_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<ProcessList id="{process_id}" compCLFversion="3.0">
+    <Description>Color matrix calculated by Macbeth Calibrator 3D. Transforms from {input_desc} to {output_desc}.</Description>
+    <InputDescriptor>{input_desc}</InputDescriptor>
+    <OutputDescriptor>{output_desc}</OutputDescriptor>
+    <Matrix inBitDepth="32f" outBitDepth="32f">
+        <Array dim="3 3">
+            {m_flat[0]:.9f} {m_flat[1]:.9f} {m_flat[2]:.9f}
+            {m_flat[3]:.9f} {m_flat[4]:.9f} {m_flat[5]:.9f}
+            {m_flat[6]:.9f} {m_flat[7]:.9f} {m_flat[8]:.9f}
+        </Array>
+    </Matrix>
+</ProcessList>
+"""
+        try:
+            with open(self.filepath, 'w', encoding='utf-8') as f:
+                f.write(clf_content)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to write file: {e}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Exported CLF matrix to {self.filepath}")
+        return {'FINISHED'}
+
 # --- UI Panel ---
 class MB_PT_CalibratorPanel(bpy.types.Panel):
     """Creates the UI Panel in the 3D View Sidebar"""
@@ -917,10 +906,6 @@ class MB_PT_CalibratorPanel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        if not _dependencies_met:
-            layout.label(text="NumPy dependency not met. Check console.", icon='ERROR')
-            return
-
         settings = None
         try:
             scene = context.scene
@@ -982,6 +967,10 @@ class MB_PT_CalibratorPanel(bpy.types.Panel):
         for line in matrix_lines:
             row_mat_line = col_matrix_lines.row()
             row_mat_line.label(text=line)
+        
+        export_op_layout = col_matrix_lines.row(align=True)
+        export_op_layout.active = settings.calculation_done
+        export_op_layout.operator(MB_OT_ExportCLF.bl_idname, text="Export .clf", icon='EXPORT')
 
 # --- Registration ---
 classes = (
@@ -991,18 +980,12 @@ classes = (
     MB_OT_SetBackground,
     MB_OT_CalculateMatrix,
     MB_OT_ApplyToCompositor,
+    MB_OT_ExportCLF,
     MB_PT_CalibratorPanel,
 )
 
 def register():
     """Registers all addon classes and adds properties."""
-    if not check_dependencies():
-        raise Exception("Failed to meet NumPy dependency. Addon cannot start. Check console for details.")
-
-    global core
-    # Use importlib for a more robust way to load the submodule
-    core = importlib.import_module(".core", __package__)
-    
     for cls in classes:
         bpy.utils.register_class(cls)
     

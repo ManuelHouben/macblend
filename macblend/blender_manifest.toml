@@ -1,0 +1,15 @@
+# See https://docs.blender.org/api/main/extensions.html
+schema_version = "1.0.0"
+id = "macblend"
+name = "Macbeth Calibrator 3D"
+tagline = "Calibrate colors in your scene using a Macbeth chart"
+type = "add-on"
+maintainer = "Manuel Houben"
+version = "1.5.1"
+blender_version_min = "4.0.0"
+description = "Calculates a color matrix using a Macbeth chart."
+tags = ["Color"]
+license = ["GPL-2.0-or-later"]
+
+[permissions]
+files = "Read color transform data and export CLF files"
