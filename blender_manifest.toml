@@ -9,7 +9,7 @@ version = "1.5.1"
 blender_version_min = "4.0.0"
 description = "Calculates a color matrix using a Macbeth chart."
 tags = ["Color"]
-license = ["GPL-2.0-or-later"]
+license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
 files = "Read color transform data and export CLF files"
