@@ -2,8 +2,6 @@
 # <pep8 compliant>
 
 import sys
-print(f"DEBUG: Module name is: {__name__}")
-print(f"DEBUG: Module file is: {__file__}")
 
 # --- Imports ---
 import bpy
@@ -90,9 +88,6 @@ def get_pixel_coords(norm_coords, image_width, image_height):
         if image_width <= 0 or image_height <= 0:
             return None
         px = norm_coords.x * image_width
-        # The console output shows a perfect vertical flip. The only place a Y-flip
-        # occurs is here. Based on the sampling results, we should not be flipping
-        # the Y-coordinate.
         py = norm_coords.y * image_height
         px_clamped = max(0, min(image_width - 1, px))
         py_clamped = max(0, min(image_height - 1, py))
@@ -519,15 +514,9 @@ class MB_OT_SetupSampleMarkers(bpy.types.Operator):
             print(f"Cleared {len(objects_to_delete)} objects from rig collection.")
 
         # Cleanup old data-blocks to prevent file bloat
-        for old_data in [bpy.data.meshes.get("MB_Sample_Marker_Mesh"), bpy.data.curves.get("MB_Sample_Marker_Curve")]:
-            if old_data:
-                try:
-                    bpy.data.curves.remove(old_data)
-                except TypeError: # It might be a mesh
-                    try:
-                        bpy.data.meshes.remove(old_data)
-                    except:
-                        pass # Fails if users exist, which is fine.
+        old_curve = bpy.data.curves.get("MB_Sample_Marker_Curve")
+        if old_curve:
+            bpy.data.curves.remove(old_curve)
 
         original_active = view_layer.objects.active
         original_selected = context.selected_objects[:]
@@ -561,7 +550,6 @@ class MB_OT_SetupSampleMarkers(bpy.types.Operator):
             
             # FORCE an update of the dependency graph so the new objects have their matrices.
             context.view_layer.update()
-            print("Forced depsgraph update after creating controllers.")
 
             # --- Create Sample Markers using CURVE objects ---
             marker_curve = bpy.data.curves.new("MB_Sample_Marker_Curve", type='CURVE')
@@ -605,16 +593,8 @@ class MB_OT_SetBackground(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        if not context or not context.scene or not hasattr(context.scene, 'macbeth_calibrator_settings'):
-            return False
         settings = context.scene.macbeth_calibrator_settings
-        if settings is None:
-            return False
-        if not hasattr(settings, "cam") or settings.cam is None:
-            return False
-        if not hasattr(settings, "image") or settings.image is None:
-            return False
-        return True
+        return settings and settings.cam and settings.image
 
     def execute(self, context):
         settings = context.scene.macbeth_calibrator_settings
@@ -681,41 +661,17 @@ class MB_OT_CalculateMatrix(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        if not context or not context.scene or not hasattr(context.scene, 'macbeth_calibrator_settings'):
-            return False
         settings = context.scene.macbeth_calibrator_settings
-        if settings is None or type(settings).__name__ == '_PropertyDeferred':
+        if not (settings and settings.cam and settings.image and settings.image.has_data):
             return False
-        cam_val = getattr(settings, "cam", None)
-        if cam_val is None or type(cam_val).__name__ == '_PropertyDeferred':
-            return False
-        if cam_val.type != 'CAMERA':
-            return False
-        image_val = getattr(settings, "image", None)
-        if image_val is None or type(image_val).__name__ == '_PropertyDeferred':
-            return False
-        has_valid_image = False
-        try:
-            if image_val.has_data:
-                has_valid_image = True
-        except:
-            pass
-        if not has_valid_image:
-            return False
-        if not hasattr(settings, "marker_collection_name"):
-            return False
-        collection_name = getattr(settings, "marker_collection_name", None)
-        if collection_name is None or type(collection_name).__name__ == '_PropertyDeferred':
-            return False
-        marker_collection = bpy.data.collections.get(collection_name)
+
+        marker_collection = bpy.data.collections.get(settings.marker_collection_name)
         if not marker_collection:
             return False
         
         # Only count the actual sample markers, not the controllers
         markers = [o for o in marker_collection.objects if o.name.startswith("MB_Sample_")]
-        if len(markers) < 24:
-            return False
-        return True
+        return len(markers) >= 24
 
     def execute(self, context):
         # This dictionary passes non-numpy-dependent helper functions and data
@@ -765,6 +721,8 @@ class MB_OT_ApplyToCompositor(bpy.types.Operator):
         context.view_layer.update()
         
         try:
+            # NOTE: The 'ColorMatrix' node group expects its inputs in column-major order.
+            # We are feeding the columns of our transform matrix into the 'Output Red/Green/Blue' vectors.
             if 'Output Red' in node.inputs:
                 node.inputs['Output Red'].default_value = (matrix_values[0], matrix_values[3], matrix_values[6])
             if 'Output Green' in node.inputs:
@@ -998,9 +956,8 @@ def register():
 def unregister():
     """Unregisters all addon classes and removes properties."""
     # Remove the handler safely
-    for handler in bpy.app.handlers.depsgraph_update_post:
-        if handler.__name__ == "macbeth_depsgraph_handler":
-            bpy.app.handlers.depsgraph_update_post.remove(handler)
+    if macbeth_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(macbeth_depsgraph_handler)
             
     try:
         del bpy.types.Scene.macbeth_calibrator_settings
@@ -1012,10 +969,3 @@ def unregister():
             bpy.utils.unregister_class(cls)
         except (RuntimeError):
             pass
-
-if __name__ == "__main__":
-    try:
-        unregister()
-    except Exception as e:
-        print(f"Error during auto-unregister: {e}")
-    register()

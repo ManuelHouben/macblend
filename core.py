@@ -16,32 +16,15 @@ MACBETH_LINEAR_SRGB_D65_BASE = np.array([
 
 LUMA_COEFFS_ACES = np.array([0.27222872, 0.67408177, 0.05368952], dtype=np.float32)
 
-def sample_image_color(image, px, py, sample_size):
-    """Samples average RGB from image.pixels at (px, py) over a box."""
+def sample_image_color(pixels_np, width, height, px, py, sample_size):
+    """Samples average RGB from a NumPy pixel array at (px, py) over a box."""
     fallback_color = (0.0, 0.0, 0.0)
-    if not image or not image.has_data:
-        return fallback_color
-    try:
-        width, height = image.size
-    except Exception as e:
-        print(f"Error: Cannot get dimensions for image '{image.name}': {e}")
-        return fallback_color
+    
     if not (0 <= px < width and 0 <= py < height):
         return fallback_color
+
     if sample_size <= 0:
         sample_size = 1
-    try:
-        image_pixels_sequence = image.pixels[:]
-        if not image_pixels_sequence:
-            return fallback_color
-        pixels_np = np.fromiter(image_pixels_sequence, dtype=np.float32)
-        expected_len = width * height * 4
-        if pixels_np.size != expected_len:
-            return fallback_color
-        pixels_np = pixels_np.reshape((height, width, 4))
-    except Exception as e:
-        print(f"Error accessing image pixels for '{image.name}': {e}")
-        return fallback_color
 
     half_size = sample_size // 2
     y_start = max(0, py - half_size)
@@ -50,18 +33,18 @@ def sample_image_color(image, px, py, sample_size):
     x_end = min(width, px + half_size + (sample_size % 2))
 
     if y_start >= y_end or x_start >= x_end:
-        try:
-            safe_py = max(0, min(height - 1, py))
-            safe_px = max(0, min(width - 1, px))
-            return tuple(pixels_np[safe_py, safe_px, :3])
-        except IndexError:
-            return fallback_color
+        # If the sample area is invalid, fall back to a single pixel sample
+        safe_py = max(0, min(height - 1, py))
+        safe_px = max(0, min(width - 1, px))
+        return tuple(pixels_np[safe_py, safe_px, :3])
+
     try:
         sample_region = pixels_np[y_start:y_end, x_start:x_end, :3]
         if sample_region.size > 0:
             average_color = np.mean(sample_region, axis=(0, 1))
             return tuple(average_color)
         else:
+            # This case should be rare, but acts as a fallback
             safe_py = max(0, min(height - 1, py))
             safe_px = max(0, min(width - 1, px))
             return tuple(pixels_np[safe_py, safe_px, :3])
@@ -71,7 +54,6 @@ def sample_image_color(image, px, py, sample_size):
 
 def calculate_matrix(input_samples, ref_samples):
     """Calculates the 3x3 calibration matrix using numpy least squares."""
-    print("      Calculating matrix...")
     if not isinstance(input_samples, np.ndarray) or input_samples.shape != (24, 3):
         print(f"      Err: Invalid input samples. Shape: {input_samples.shape if isinstance(input_samples, np.ndarray) else type(input_samples)}")
         return None
@@ -85,11 +67,10 @@ def calculate_matrix(input_samples, ref_samples):
         print("      Err: Reference samples contain NaN or Inf values.")
         return None
     try:
-        rcond_val = sys.float_info.epsilon * max(input_samples.shape)
-        result_x, residuals, rank, s = np.linalg.lstsq(input_samples, ref_samples, rcond=rcond_val)
+        # Let numpy determine the rcond value for best precision
+        result_x, residuals, rank, s = np.linalg.lstsq(input_samples, ref_samples, rcond=None)
         matrix_calculated = result_x
-        print(f"        lstsq residuals: {residuals}")
-        print(f"        lstsq rank: {rank}, singular values: {s[:5]}...")
+        print(f"        lstsq rank: {rank}, residuals: {residuals}")
     except np.linalg.LinAlgError as e:
         print(f"      LinAlgError during least squares calculation: {e}")
         return None
@@ -100,7 +81,6 @@ def calculate_matrix(input_samples, ref_samples):
         print(f"      Err: Resulting matrix shape is incorrect: {matrix_calculated.shape}")
         return None
     matrix_final = matrix_calculated.T
-    print("        Matrix calculation successful.")
     return matrix_final.tolist()
 
 def run_calculation(context, operator, helpers):
@@ -119,7 +99,7 @@ def run_calculation(context, operator, helpers):
         operator.report({'WARNING'}, "Failed to load JSON data. Only 'Linear sRGB D65' target is available.")
 
     selected_target = settings.target_colorspace
-    print(f"--- Selected Target Colorspace: {selected_target} ---")
+    print(f"--- Calculating matrix for target: {selected_target} ---")
 
     try:
         if settings is None:
@@ -153,35 +133,37 @@ def run_calculation(context, operator, helpers):
         img_w, img_h = img.size
         if img_w <= 0 or img_h <= 0:
             raise ValueError(f"Invalid image dimensions: {img_w}x{img_h}")
-        print("      Initial checks OK.")
     except Exception as e_setup:
-        print(f"      ERROR during initial setup: {e_setup}")
         helpers['traceback'].print_exc()
         operator.report({'ERROR'}, f"Initial setup error: {e_setup}")
         if settings:
             settings.matrix_display_string = f"Setup Error: {e_setup}"
         return {'CANCELLED'}
 
-    print("      Forcing dependency graph update to get latest marker positions...")
+    # Force a dependency graph update to ensure marker positions are current
     context.view_layer.update()
-    print("      Update complete.")
     
-    raw_set_successfully = False
-    pixel_coords_list = []
-    original_view_transform = None
-    input_samples_raw = None
-
     try:
-        print("      Block: Projecting sample markers...")
+        # Get image pixels ONCE and convert to a NumPy array for efficient access.
+        # This is the main performance improvement.
+        img_w, img_h = img.size
+        pixels_np = np.array(img.pixels[:]).reshape((img_h, img_w, 4))
+    except Exception as e:
+        operator.report({'ERROR'}, f"Could not read image pixels: {e}")
+        helpers['traceback'].print_exc()
+        return {'CANCELLED'}
+
+    input_samples_raw = None
+    original_view_transform = context.scene.view_settings.view_transform
+    
+    try:
         ndc_coords = [helpers['get_projected_coords'](context, cam, m) for m in markers]
         if not all(ndc is not None for ndc in ndc_coords):
-            raise ValueError("Marker projection failed.")
+            raise ValueError("Marker projection failed for one or more markers.")
         pixel_coords_list = [helpers['get_pixel_coords'](ndc, img_w, img_h) for ndc in ndc_coords]
         if not all(p is not None for p in pixel_coords_list):
-            raise ValueError("Pixel coordinate conversion failed.")
-        print(f"        Projected {len(pixel_coords_list)} marker centers.")
+            raise ValueError("Pixel coordinate conversion failed for one or more markers.")
 
-        print("      Block: Calculating Sample Size in Pixels...")
         try:
             corners = [settings.corner_tl, settings.corner_tr, settings.corner_br, settings.corner_bl]
             corner_ndc = [helpers['get_projected_coords'](context, cam, c) for c in corners]
@@ -207,94 +189,64 @@ def run_calculation(context, operator, helpers):
             print(f"        WARNING: Could not calculate dynamic pixel sample size ({e_ss}). Falling back to 10px.")
             current_sample_size = 10
 
-        print("      Block: Setting up Color Management and Sampling...")
+        raw_set_successfully = False
         try:
-            original_view_transform = context.scene.view_settings.view_transform
-            print(f"        Original View Transform: '{original_view_transform}'")
-            TARGET_VIEW = 'Raw'
-            print(f"        Attempting to set View Transform to '{TARGET_VIEW}'...")
-            context.scene.view_settings.view_transform = TARGET_VIEW
-            helpers['bpy'].context.view_layer.update()
-            if context.scene.view_settings.view_transform == TARGET_VIEW:
-                print(f"        Successfully set View Transform to '{TARGET_VIEW}'.")
-                raw_set_successfully = True
-            else:
-                print(f"        WARNING: Failed set View Transform to '{TARGET_VIEW}'.")
-                operator.report({'WARNING'}, f"Failed set View Transform to '{TARGET_VIEW}'.")
+            context.scene.view_settings.view_transform = 'Raw'
+            # The view layer update is crucial after changing color management settings
+            context.view_layer.update()
+            raw_set_successfully = context.scene.view_settings.view_transform == 'Raw'
+            if not raw_set_successfully:
+                 operator.report({'WARNING'}, "Failed to set View Transform to 'Raw'.")
         except Exception as e_cm_set:
-            print(f"      ERROR setting View Transform: {e_cm_set}")
-            operator.report({'ERROR'}, f"CM Setup Error: {e_cm_set}")
+            operator.report({'ERROR'}, f"Could not set 'Raw' view transform: {e_cm_set}")
 
-        print(f"        Sampling {len(markers)} patches with size {current_sample_size}...")
         input_samples_list = []
-        if not img.has_data:
-            raise ValueError("Image data lost before sampling loop.")
-        if pixel_coords_list is None:
-            raise ValueError("Pixel coordinates list is None before sampling loop.")
-
-        print("\n        --- Sampled Patch Values (Scene Linear) ---")
         for i, coords in enumerate(pixel_coords_list):
-            if coords is None or not isinstance(coords, (tuple, list)) or len(coords) != 2:
-                print(f"        --> WARNING: Invalid pixel coordinates for patch {i + 1}.")
+            if coords is None:
                 linear_color_rgb = (0.0, 0.0, 0.0)
             else:
-                px, py = coords              
-                sampled_color_rgb = sample_image_color(img, px, py, current_sample_size)
-                if sampled_color_rgb is None or not isinstance(sampled_color_rgb, (tuple, list)) or len(sampled_color_rgb) != 3:
-                    print(f"        --> WARNING: Invalid sample patch {i + 1}.")
-                    linear_color_rgb = (0.0, 0.0, 0.0)
+                px, py = coords
+                # Pass the numpy array directly for huge performance gain
+                sampled_color_rgb = sample_image_color(pixels_np, img_w, img_h, px, py, current_sample_size)
+                
+                if raw_set_successfully:
+                    linear_color_rgb = sampled_color_rgb
                 else:
-                    if raw_set_successfully:
-                        linear_color_rgb = sampled_color_rgb
-                    else:
-                        try:
-                            clamped_color = tuple(max(0.0, min(1.0, val)) for val in sampled_color_rgb)
-                            linear_color_rgb = helpers['linearize_color'](clamped_color)
-                        except Exception as e_lin:
-                            print(f"        --> ERROR linearizing patch {i + 1}: {e_lin}.")
-                            linear_color_rgb = (0.0, 0.0, 0.0)
+                    # Fallback to manual linearization if 'Raw' view transform failed
+                    try:
+                        clamped_color = tuple(max(0.0, min(1.0, val)) for val in sampled_color_rgb)
+                        linear_color_rgb = helpers['linearize_color'](clamped_color)
+                    except Exception as e_lin:
+                        print(f"        --> ERROR linearizing patch {i + 1}: {e_lin}.")
+                        linear_color_rgb = (0.0, 0.0, 0.0)
             
             input_samples_list.append(linear_color_rgb)
-            patch_name = helpers['MACBETH_PATCH_NAMES'][i]
-            print(f"        {i+1:>2d}: {patch_name:<16} R={linear_color_rgb[0]:.6f} G={linear_color_rgb[1]:.6f} B={linear_color_rgb[2]:.6f}")
-        print("        -------------------------------------------\n")
 
-        print(f"        Finished sampling. Collected {len(input_samples_list)} samples.")
         if len(input_samples_list) != 24:
             raise ValueError(f"Expected 24 samples, got {len(input_samples_list)}.")
 
         input_samples_raw = np.array(input_samples_list, dtype=np.float32)
         if input_samples_raw.shape != (24, 3):
             raise ValueError(f"Input samples shape incorrect: {input_samples_raw.shape}")
-        print("      Sampling OK (Result is in Scene Linear Color Space - assumed ACEScg).")
 
     except Exception as e_sampling:
-        print(f"      ERROR during sampling/projection/linearization: {e_sampling}")
         helpers['traceback'].print_exc()
         operator.report({'ERROR'}, f"Sampling error: {e_sampling}")
-        input_samples_raw = None
-        if settings:
-            settings.calculation_done = False
-            settings.calculated_matrix = [1,0,0, 0,1,0, 0,0,1]
-            settings.matrix_display_string = f"Sampling Error: {e_sampling}"
+        settings.calculation_done = False
+        settings.calculated_matrix = [1,0,0, 0,1,0, 0,0,1]
+        settings.matrix_display_string = f"Sampling Error: {e_sampling}"
     finally:
-        if original_view_transform is not None and hasattr(context.scene, 'view_settings') and context.scene.view_settings.view_transform != original_view_transform:
-            print(f"        Attempting to restore View Transform to '{original_view_transform}'...")
+        # Always restore the original view transform
+        if context.scene.view_settings.view_transform != original_view_transform:
             try:
                 context.scene.view_settings.view_transform = original_view_transform
-                helpers['bpy'].context.view_layer.update()
-                print(f"        Successfully restored View Transform.")
+                context.view_layer.update()
             except Exception as e_cm_restore:
                 print(f"      ERROR restoring original view transform '{original_view_transform}': {e_cm_restore}")
                 operator.report({'ERROR'}, f"CM Restore Error: {e_cm_restore}")
-        elif original_view_transform is not None:
-            print(f"        View Transform was not changed from original ('{original_view_transform}'). No restore needed.")
 
     if input_samples_raw is not None:
-        print("--- Entering Calculation Block ---")
-        input_samples_normalized = None
         try:
-            print(f"      Block: Generating reference chart for '{selected_target}'...")
             if selected_target == "LINEAR_SRGB_D65":
                 ref_samples = MACBETH_LINEAR_SRGB_D65_BASE.copy()
             else:
