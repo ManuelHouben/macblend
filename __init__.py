@@ -69,6 +69,38 @@ def load_json_data(context):
         print(f"Error loading JSON '{json_path}': {e}")
         return None
 
+def get_image_colorspace_name(image):
+    """Returns the current Blender colorspace name for an image datablock."""
+    if not image or not getattr(image, 'colorspace_settings', None):
+        return "Unknown"
+    return image.colorspace_settings.name
+
+def get_image_sampling_guidance(image):
+    """Provides concise guidance for how the selected image colorspace affects calibration sampling."""
+    if not image:
+        return []
+
+    colorspace_name = get_image_colorspace_name(image)
+    normalized_name = colorspace_name.strip().lower()
+    file_name = (image.filepath or image.name or "").lower()
+    guidance = [
+        "Sampling reads Blender's decoded image buffer.",
+        "Display/View Transform affects viewing, not sampled values.",
+    ]
+
+    if normalized_name == 'non-color':
+        guidance.append("Use Non-Color only for data or intentional transform bypass.")
+        if file_name.endswith('.exr'):
+            guidance.append("EXR plates usually need their true source colorspace, not Non-Color.")
+    elif 'acescg' in normalized_name:
+        guidance.append("ACEScg tagging is correct only if the file is actually ACEScg scene-linear.")
+    elif 'linear' in normalized_name:
+        guidance.append("Linear tagging is appropriate only when the file is already scene-linear in that gamut.")
+    else:
+        guidance.append("Non-linear image tagging will change sampled values before calibration.")
+
+    return guidance
+
 def get_projected_coords(context, camera, obj):
     """Projects a 3D point to normalized 2D camera coordinates."""
     if not context or not camera or not obj or not obj.matrix_world or not camera.data:
@@ -424,6 +456,11 @@ class MacbethCalibratorSettings(bpy.types.PropertyGroup):
         description="Adjust source samples to match TARGET grey luminance before matrix calculation",
         default=True
     )
+    debug_parity_logging: BoolProperty(
+        name="Debug Parity Logging",
+        description="Print sampled input patches and additional parity diagnostics to the console for Nuke comparison",
+        default=False
+    )
     target_colorspace: EnumProperty(
         name="Target Colorspace",
         description="Select the target colorspace reference values",
@@ -682,6 +719,7 @@ class MB_OT_CalculateMatrix(bpy.types.Operator):
             'load_json_data': load_json_data,
             'get_projected_coords': get_projected_coords,
             'get_pixel_coords': get_pixel_coords,
+            'get_image_colorspace_name': get_image_colorspace_name,
             'linearize_color': linearize_color,
             'MACBETH_PATCH_NAMES': MACBETH_PATCH_NAMES,
             'NEUTRAL_5_INDEX': NEUTRAL_5_INDEX
@@ -721,14 +759,13 @@ class MB_OT_ApplyToCompositor(bpy.types.Operator):
         context.view_layer.update()
         
         try:
-            # NOTE: The 'ColorMatrix' node group expects its inputs in column-major order.
-            # We are feeding the columns of our transform matrix into the 'Output Red/Green/Blue' vectors.
+            # Match CalibrateMacbeth behavior: keep matrix storage/application in row-major order.
             if 'Output Red' in node.inputs:
-                node.inputs['Output Red'].default_value = (matrix_values[0], matrix_values[3], matrix_values[6])
+                node.inputs['Output Red'].default_value = (matrix_values[0], matrix_values[1], matrix_values[2])
             if 'Output Green' in node.inputs:
-                node.inputs['Output Green'].default_value = (matrix_values[1], matrix_values[4], matrix_values[7])
+                node.inputs['Output Green'].default_value = (matrix_values[3], matrix_values[4], matrix_values[5])
             if 'Output Blue' in node.inputs:
-                node.inputs['Output Blue'].default_value = (matrix_values[2], matrix_values[5], matrix_values[8])
+                node.inputs['Output Blue'].default_value = (matrix_values[6], matrix_values[7], matrix_values[8])
         except Exception as e:
             self.report({'ERROR'}, f"Failed to set matrix on '{node.name}': {e}")
             traceback.print_exc()
@@ -790,67 +827,149 @@ class MB_OT_ApplyToCompositor(bpy.types.Operator):
         self.report({'INFO'}, f"Set matrix for '{forward_node_name}' and '{inverse_node_name}'.")
         return {'FINISHED'}
 
-class MB_OT_ExportCLF(bpy.types.Operator, ExportHelper):
-    """Exports the calculated matrix to a Common LUT Format (.clf) file"""
-    bl_idname = "mbcalib.export_clf"
-    bl_label = "Export Matrix as CLF"
+class MB_OT_ExportLUT(bpy.types.Operator, ExportHelper):
+    """Exports the calculated matrix to a .cube LUT file"""
+    bl_idname = "mbcalib.export_lut"
+    bl_label = "Export Matrix as LUT (.cube)"
     bl_options = {'REGISTER'}
-
-    filename_ext = ".clf"
+    
+    filename_ext = ".cube"
     filter_glob: StringProperty(
-        default="*.clf",
+        default="*.cube",
         options={'HIDDEN'},
         maxlen=255,
     )
-
+    
+    lut_size: EnumProperty(
+        name="LUT Size",
+        description="Size of the 3D LUT cube. Larger sizes are more accurate but create larger files",
+        items=[
+            ('17', "17×17×17", "Small LUT (17³ = 4,913 samples, ~144 KB)"),
+            ('33', "33×33×33", "Standard LUT (33³ = 35,937 samples, ~1 MB)"),
+            ('65', "65×65×65", "High Quality LUT (65³ = 274,625 samples, ~8 MB)"),
+        ],
+        default='33',
+    )
+    
+    linear_only: BoolProperty(
+        name="Linear Space Only",
+        description="Export a linear LUT (no transfer function). The LUT operates on linear RGB values. "
+                   "If disabled, the LUT would include transfer function conversion (not yet implemented)",
+        default=True,
+    )
+    
     @classmethod
     def poll(cls, context):
         if not context or not context.scene or not hasattr(context.scene, 'macbeth_calibrator_settings'):
             return False
         settings = context.scene.macbeth_calibrator_settings
         return settings and settings.calculation_done
-
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+    
     def execute(self, context):
+        import numpy as np
         settings = context.scene.macbeth_calibrator_settings
         
-        # The FloatVectorProperty with subtype='MATRIX' returns a mathutils.Matrix object.
-        # We must flatten this 3x3 matrix into a single list of 9 floats
-        # for the f-string formatting to work correctly.
+        # Get matrix from settings
         matrix = settings.calculated_matrix
-        m_flat = [value for row in matrix for value in row]
+        if isinstance(matrix, mathutils.Matrix):
+            # Convert mathutils.Matrix to numpy array
+            matrix_np = np.array([list(row) for row in matrix], dtype=np.float32)
+        else:
+            # Assume it's already a list/array, reshape to 3x3
+            matrix_flat = list(matrix)
+            if len(matrix_flat) != 9:
+                self.report({'ERROR'}, f"Invalid matrix size: {len(matrix_flat)}")
+                return {'CANCELLED'}
+            matrix_np = np.array(matrix_flat, dtype=np.float32).reshape(3, 3)
         
-        process_id = settings.node_name if settings.node_name else "MacbethCalibratorExport"
-
-        # The core logic assumes input is the scene-linear space, which in a default
-        # Blender setup is Linear sRGB (with Rec.709 primaries). The CLF file
-        # must accurately describe this transform.
+        # Convert matrix to LUT
+        lut_size = int(self.lut_size)
+        try:
+            lut_data = core.matrix_to_lut(matrix_np, lut_size)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to generate LUT: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+        
+        # Get colorspace information for metadata
         input_desc = "Linear Rec.709 (sRGB)"
         output_desc = settings.target_colorspace
         if output_desc == 'LINEAR_SRGB_D65':
-             output_desc = "Linear Rec.709 (sRGB)"
-
-        clf_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<ProcessList id="{process_id}" compCLFversion="3.0">
-    <Description>Color matrix calculated by Macbeth Calibrator 3D. Transforms from {input_desc} to {output_desc}.</Description>
-    <InputDescriptor>{input_desc}</InputDescriptor>
-    <OutputDescriptor>{output_desc}</OutputDescriptor>
-    <Matrix inBitDepth="32f" outBitDepth="32f">
-        <Array dim="3 3">
-            {m_flat[0]:.9f} {m_flat[1]:.9f} {m_flat[2]:.9f}
-            {m_flat[3]:.9f} {m_flat[4]:.9f} {m_flat[5]:.9f}
-            {m_flat[6]:.9f} {m_flat[7]:.9f} {m_flat[8]:.9f}
-        </Array>
-    </Matrix>
-</ProcessList>
-"""
+            output_desc = "Linear Rec.709 (sRGB)"
+        
+        # Try to get whitepoint from JSON
+        target_whitepoint = 'D65'  # default
+        try:
+            json_data = load_json_data(context)
+            if json_data and output_desc in json_data.get("whitepoints", {}):
+                target_whitepoint = json_data["whitepoints"][output_desc]
+        except Exception:
+            pass  # Use default if JSON loading fails
+        
+        # Determine if this is a linear-only LUT
+        lut_type_note = ""
+        if self.linear_only:
+            lut_type_note = (
+                "This is a LINEAR LUT. It operates on linear RGB values.\n"
+                "# Input and output are both in linear space.\n"
+                "# No transfer function (gamma/log) conversion is applied.\n"
+                "# Use this when your application handles transfer functions separately."
+            )
+        else:
+            lut_type_note = (
+                "NOTE: Transfer function conversion is not yet implemented.\n"
+                "# This LUT currently operates in linear space."
+            )
+        
+        # Generate .cube file content
+        cube_lines = [
+            f"TITLE \"Macbeth Calibrator Matrix Export\"",
+            f"",
+            f"# Generated by Macbeth Calibrator 3D",
+            f"#",
+            f"# TRANSFORM INFORMATION:",
+            f"#   Input Colorspace: {input_desc}",
+            f"#   Output Colorspace: {output_desc}",
+            f"#   Output Whitepoint: {target_whitepoint}",
+            f"#   LUT Size: {lut_size}×{lut_size}×{lut_size}",
+            f"#",
+            f"# LUT TYPE:",
+            f"# {lut_type_note}",
+            f"#",
+            f"# The matrix transform is sampled across the RGB cube.",
+            f"# Values are clamped to [0.0, 1.0] range.",
+            f"",
+            f"LUT_3D_SIZE {lut_size}",
+            f"DOMAIN_MIN 0.0 0.0 0.0",
+            f"DOMAIN_MAX 1.0 1.0 1.0",
+            f"",
+        ]
+        
+        # Write LUT data - .cube format expects R G B per line
+        # Swap R and B channels in output to fix red/blue channel swap issue
+        # Some .cube readers may interpret channels differently
+        for i in range(lut_data.shape[0]):
+            r, g, b = lut_data[i]
+            # Swap R and B: write as B G R instead of R G B
+            cube_lines.append(f"{b:.6f} {g:.6f} {r:.6f}")
+        
+        cube_content = "\n".join(cube_lines)
+        
+        # Write file
         try:
             with open(self.filepath, 'w', encoding='utf-8') as f:
-                f.write(clf_content)
+                f.write(cube_content)
         except Exception as e:
             self.report({'ERROR'}, f"Failed to write file: {e}")
             return {'CANCELLED'}
-
-        self.report({'INFO'}, f"Exported CLF matrix to {self.filepath}")
+        
+        lut_type_str = "Linear" if self.linear_only else "With Transfer"
+        self.report({'INFO'}, f"Exported {lut_size}³ {lut_type_str} LUT to {self.filepath}")
         return {'FINISHED'}
 
 # --- UI Panel ---
@@ -885,6 +1004,15 @@ class MB_PT_CalibratorPanel(bpy.types.Panel):
         col_input.prop(settings, "cam", text="Camera")
         col_input.prop(settings, "image", text="Image")
 
+        if settings.image and getattr(settings.image, 'colorspace_settings', None):
+            box_colorspace = col_input.box()
+            box_colorspace.label(text="Sampling Colorspace:")
+            box_colorspace.prop(settings.image.colorspace_settings, "name", text="Image")
+            box_colorspace.label(text=f"Display Device: {scene.display_settings.display_device}")
+            box_colorspace.label(text=f"View Transform: {scene.view_settings.view_transform}")
+            for guidance_line in get_image_sampling_guidance(settings.image):
+                box_colorspace.label(text=guidance_line)
+
         row_buttons = col_input.row(align=True)
         set_bg_layout = row_buttons.row(align=True)
         set_bg_layout.operator(MB_OT_SetBackground.bl_idname, text="Set BG")
@@ -899,6 +1027,7 @@ class MB_PT_CalibratorPanel(bpy.types.Panel):
         col_settings.separator()
         col_settings.prop(settings, "sample_size")
         col_settings.prop(settings, "chroma_only")
+        col_settings.prop(settings, "debug_parity_logging")
 
         layout.separator()
         layout.label(text="3. Calculate & Apply:")
@@ -928,7 +1057,7 @@ class MB_PT_CalibratorPanel(bpy.types.Panel):
         
         export_op_layout = col_matrix_lines.row(align=True)
         export_op_layout.active = settings.calculation_done
-        export_op_layout.operator(MB_OT_ExportCLF.bl_idname, text="Export .clf", icon='EXPORT')
+        export_op_layout.operator(MB_OT_ExportLUT.bl_idname, text="Export .cube LUT", icon='EXPORT')
 
 # --- Registration ---
 classes = (
@@ -938,7 +1067,7 @@ classes = (
     MB_OT_SetBackground,
     MB_OT_CalculateMatrix,
     MB_OT_ApplyToCompositor,
-    MB_OT_ExportCLF,
+    MB_OT_ExportLUT,
     MB_PT_CalibratorPanel,
 )
 

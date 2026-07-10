@@ -14,7 +14,8 @@ MACBETH_LINEAR_SRGB_D65_BASE = np.array([
     [0.19008669, 0.19086038, 0.1898278 ], [0.08593528, 0.08873843, 0.08978779], [0.03135966, 0.03149993, 0.03231098]
 ], dtype=np.float32)
 
-LUMA_COEFFS_ACES = np.array([0.27222872, 0.67408177, 0.05368952], dtype=np.float32)
+# CalibrateMacbeth.nk uses Rec.709 luminance coefficients for chroma-only normalization.
+LUMA_COEFFS_REC709 = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 def sample_image_color(pixels_np, width, height, px, py, sample_size):
     """Samples average RGB from a NumPy pixel array at (px, py) over a box."""
@@ -71,6 +72,9 @@ def calculate_matrix(input_samples, ref_samples):
         result_x, residuals, rank, s = np.linalg.lstsq(input_samples, ref_samples, rcond=None)
         matrix_calculated = result_x
         print(f"        lstsq rank: {rank}, residuals: {residuals}")
+        print("        Raw lstsq matrix:")
+        for row in matrix_calculated:
+            print(f"          [{row[0]:>9.6f} {row[1]:>9.6f} {row[2]:>9.6f}]")
     except np.linalg.LinAlgError as e:
         print(f"      LinAlgError during least squares calculation: {e}")
         return None
@@ -80,8 +84,56 @@ def calculate_matrix(input_samples, ref_samples):
     if matrix_calculated.shape != (3, 3):
         print(f"      Err: Resulting matrix shape is incorrect: {matrix_calculated.shape}")
         return None
+    # CalibrateMacbeth.nk transposes the raw lstsq result before flattening/storing it.
     matrix_final = matrix_calculated.T
+    print("        Nuke-style transposed matrix:")
+    for row in matrix_final:
+        print(f"          [{row[0]:>9.6f} {row[1]:>9.6f} {row[2]:>9.6f}]")
     return matrix_final.tolist()
+
+def matrix_to_lut(matrix_3x3, lut_size=33):
+    """
+    Converts a 3x3 color matrix to a 3D LUT.
+    
+    The LUT samples the matrix transform across the RGB cube.
+    This creates a linear LUT (no transfer function applied).
+    
+    Args:
+        matrix_3x3: numpy array of shape (3, 3) representing the color transform
+        lut_size: Size of the LUT cube (default 33, common values are 17, 33, 65)
+    
+    Returns:
+        numpy array of shape (lut_size^3, 3) containing RGB output values in [0, 1]
+        Samples are ordered for .cube format: blue varies fastest, then green, then red
+    """
+    if not isinstance(matrix_3x3, np.ndarray):
+        matrix_3x3 = np.array(matrix_3x3, dtype=np.float32)
+    
+    if matrix_3x3.shape != (3, 3):
+        raise ValueError(f"matrix_3x3 must be shape (3, 3), got {matrix_3x3.shape}")
+    
+    # Create input RGB grid in linear space [0, 1]
+    grid = np.linspace(0.0, 1.0, lut_size, dtype=np.float32)
+    
+    # .cube format requires samples where blue varies fastest, then green, then red
+    # Generate samples in the correct iteration order
+    input_rgb = np.zeros((lut_size ** 3, 3), dtype=np.float32)
+    
+    idx = 0
+    for r_val in grid:
+        for g_val in grid:
+            for b_val in grid:
+                input_rgb[idx] = [r_val, g_val, b_val]
+                idx += 1
+    
+    # Apply matrix transform: output = input @ matrix.T
+    # This is a linear transform operating on linear RGB values
+    output_rgb = np.dot(input_rgb, matrix_3x3.T)
+    
+    # Clamp to valid range [0, 1]
+    output_rgb = np.clip(output_rgb, 0.0, 1.0)
+    
+    return output_rgb
 
 def run_calculation(context, operator, helpers):
     """
@@ -93,6 +145,7 @@ def run_calculation(context, operator, helpers):
     print("\n>>> Core Calculation Logic Starting...")
     
     settings = context.scene.macbeth_calibrator_settings
+    debug_parity = bool(getattr(settings, 'debug_parity_logging', False))
 
     json_data = helpers['load_json_data'](context)
     if json_data is None:
@@ -154,7 +207,6 @@ def run_calculation(context, operator, helpers):
         return {'CANCELLED'}
 
     input_samples_raw = None
-    original_view_transform = context.scene.view_settings.view_transform
     
     try:
         ndc_coords = [helpers['get_projected_coords'](context, cam, m) for m in markers]
@@ -189,16 +241,11 @@ def run_calculation(context, operator, helpers):
             print(f"        WARNING: Could not calculate dynamic pixel sample size ({e_ss}). Falling back to 10px.")
             current_sample_size = 10
 
-        raw_set_successfully = False
-        try:
-            context.scene.view_settings.view_transform = 'Raw'
-            # The view layer update is crucial after changing color management settings
-            context.view_layer.update()
-            raw_set_successfully = context.scene.view_settings.view_transform == 'Raw'
-            if not raw_set_successfully:
-                 operator.report({'WARNING'}, "Failed to set View Transform to 'Raw'.")
-        except Exception as e_cm_set:
-            operator.report({'ERROR'}, f"Could not set 'Raw' view transform: {e_cm_set}")
+        image_colorspace = helpers['get_image_colorspace_name'](img)
+        print(f"        Image Colorspace: {image_colorspace}")
+        print(f"        Display Device: {context.scene.display_settings.display_device}")
+        print(f"        View Transform: {context.scene.view_settings.view_transform}")
+        print("        Sampling uses Blender's decoded image buffer; view transform does not change img.pixels values.")
 
         input_samples_list = []
         for i, coords in enumerate(pixel_coords_list):
@@ -208,17 +255,7 @@ def run_calculation(context, operator, helpers):
                 px, py = coords
                 # Pass the numpy array directly for huge performance gain
                 sampled_color_rgb = sample_image_color(pixels_np, img_w, img_h, px, py, current_sample_size)
-                
-                if raw_set_successfully:
-                    linear_color_rgb = sampled_color_rgb
-                else:
-                    # Fallback to manual linearization if 'Raw' view transform failed
-                    try:
-                        clamped_color = tuple(max(0.0, min(1.0, val)) for val in sampled_color_rgb)
-                        linear_color_rgb = helpers['linearize_color'](clamped_color)
-                    except Exception as e_lin:
-                        print(f"        --> ERROR linearizing patch {i + 1}: {e_lin}.")
-                        linear_color_rgb = (0.0, 0.0, 0.0)
+                linear_color_rgb = sampled_color_rgb
             
             input_samples_list.append(linear_color_rgb)
 
@@ -229,6 +266,13 @@ def run_calculation(context, operator, helpers):
         if input_samples_raw.shape != (24, 3):
             raise ValueError(f"Input samples shape incorrect: {input_samples_raw.shape}")
 
+        if debug_parity:
+            print("\n        --- Input Patch Values (Sampled) ---")
+            for i, p_in in enumerate(input_samples_raw):
+                patch_name = helpers['MACBETH_PATCH_NAMES'][i]
+                print(f"        {i+1:>2d}: {patch_name:<16} R={p_in[0]:.6f} G={p_in[1]:.6f} B={p_in[2]:.6f}")
+            print("        ------------------------------------\n")
+
     except Exception as e_sampling:
         helpers['traceback'].print_exc()
         operator.report({'ERROR'}, f"Sampling error: {e_sampling}")
@@ -236,14 +280,7 @@ def run_calculation(context, operator, helpers):
         settings.calculated_matrix = [1,0,0, 0,1,0, 0,0,1]
         settings.matrix_display_string = f"Sampling Error: {e_sampling}"
     finally:
-        # Always restore the original view transform
-        if context.scene.view_settings.view_transform != original_view_transform:
-            try:
-                context.scene.view_settings.view_transform = original_view_transform
-                context.view_layer.update()
-            except Exception as e_cm_restore:
-                print(f"      ERROR restoring original view transform '{original_view_transform}': {e_cm_restore}")
-                operator.report({'ERROR'}, f"CM Restore Error: {e_cm_restore}")
+        pass
 
     if input_samples_raw is not None:
         try:
@@ -298,10 +335,10 @@ def run_calculation(context, operator, helpers):
                 print(f"          Input Grey (ACEScg): {np.round(i_grey, 4)}")
                 print(f"          Ref Grey ({selected_target}): {np.round(r_grey, 4)}")
 
-                i_lum = np.dot(i_grey, LUMA_COEFFS_ACES)
-                r_lum = np.dot(r_grey, LUMA_COEFFS_ACES)
+                i_lum = np.dot(i_grey, LUMA_COEFFS_REC709)
+                r_lum = np.dot(r_grey, LUMA_COEFFS_REC709)
 
-                print(f"          Input Lum (ACES): {i_lum:.6f}, Ref Lum ({selected_target}, ACES): {r_lum:.6f}")
+                print(f"          Input Lum (Rec.709): {i_lum:.6f}, Ref Lum ({selected_target}, Rec.709): {r_lum:.6f}")
                 if i_lum > 1e-7:
                     norm_factor = r_lum / i_lum
                     print(f"          Norm Factor: {norm_factor:.6f}")
