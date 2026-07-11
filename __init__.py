@@ -456,6 +456,17 @@ class MacbethCalibratorSettings(bpy.types.PropertyGroup):
         description="Adjust source samples to match TARGET grey luminance before matrix calculation",
         default=True
     )
+    create_exposure_node: BoolProperty(
+        name="Create Exposure Node",
+        description="Create a separate Multiply node in the compositor to apply the luminance compensation implied by chroma-only calibration",
+        default=True
+    )
+    normalization_factor: FloatProperty(
+        name="Normalization Factor",
+        description="Stored luminance compensation factor from the last matrix calculation",
+        default=1.0,
+        min=0.0
+    )
     debug_parity_logging: BoolProperty(
         name="Debug Parity Logging",
         description="Print sampled input patches and additional parity diagnostics to the console for Nuke comparison",
@@ -736,12 +747,22 @@ class MB_OT_ApplyToCompositor(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        return scene and scene.use_nodes and hasattr(scene, 'macbeth_calibrator_settings')
+        return scene and hasattr(scene, 'macbeth_calibrator_settings')
 
     def _create_or_update_matrix_node(self, context, tree, node_name, matrix, location, group_definition):
         """Helper to create or update a single ColorMatrix node group instance."""
-        # Flatten matrix for node inputs
-        matrix_values = [item for row in matrix for item in row]
+        # Build explicit row-major values by index to avoid iteration-order ambiguity
+        # with mathutils.Matrix in newer Blender versions.
+        try:
+            m00 = float(matrix[0][0]); m01 = float(matrix[0][1]); m02 = float(matrix[0][2])
+            m10 = float(matrix[1][0]); m11 = float(matrix[1][1]); m12 = float(matrix[1][2])
+            m20 = float(matrix[2][0]); m21 = float(matrix[2][1]); m22 = float(matrix[2][2])
+        except Exception:
+            # Fallback path for flat/list-like matrices
+            matrix_values = [float(v) for row in matrix for v in row]
+            if len(matrix_values) != 9:
+                raise ValueError(f"Expected 9 matrix values, got {len(matrix_values)}")
+            m00, m01, m02, m10, m11, m12, m20, m21, m22 = matrix_values
 
         node = tree.nodes.get(node_name)
         if node and node.bl_idname != 'CompositorNodeGroup':
@@ -751,24 +772,77 @@ class MB_OT_ApplyToCompositor(bpy.types.Operator):
         if not node:
             node = tree.nodes.new(type='CompositorNodeGroup')
             node.name = node_name
-            node.label = node_name
             node.location = location
+        node.label = node_name
         
         node.node_tree = group_definition
         
         context.view_layer.update()
         
         try:
-            # Match CalibrateMacbeth behavior: keep matrix storage/application in row-major order.
+            # Nuke-style transposed matrix convention:
+            # row 1 -> Red coefficients, row 2 -> Green, row 3 -> Blue.
             if 'Output Red' in node.inputs:
-                node.inputs['Output Red'].default_value = (matrix_values[0], matrix_values[1], matrix_values[2])
+                node.inputs['Output Red'].default_value = (m00, m10, m20)
             if 'Output Green' in node.inputs:
-                node.inputs['Output Green'].default_value = (matrix_values[3], matrix_values[4], matrix_values[5])
+                node.inputs['Output Green'].default_value = (m01, m11, m21)
             if 'Output Blue' in node.inputs:
-                node.inputs['Output Blue'].default_value = (matrix_values[6], matrix_values[7], matrix_values[8])
+                node.inputs['Output Blue'].default_value = (m02, m12, m22)
         except Exception as e:
             self.report({'ERROR'}, f"Failed to set matrix on '{node.name}': {e}")
             traceback.print_exc()
+
+        return node
+
+    def _create_or_update_exposure_node(self, tree, node_name, factor, location):
+        """Helper to create or update an Exposure node used for luminance compensation."""
+        node = tree.nodes.get(node_name)
+        if node and node.bl_idname != 'CompositorNodeExposure':
+            tree.nodes.remove(node)
+            node = None
+
+        if not node:
+            node = tree.nodes.new(type='CompositorNodeExposure')
+            node.name = node_name
+            node.location = location
+
+        node.label = node_name
+        safe_factor = max(float(factor), 1e-8)
+        node.inputs[1].default_value = math.log2(safe_factor)
+        return node
+
+    def _link_if_unlinked(self, tree, from_socket, to_socket):
+        """Create a compositor link only when the destination is not already linked."""
+        if from_socket is None or to_socket is None or to_socket.is_linked:
+            return
+        tree.links.new(from_socket, to_socket)
+
+    def _ensure_compositor_tree(self, scene):
+        """Get or create a compositor node tree compatible with current Blender API."""
+        tree = getattr(scene, 'node_tree', None)
+        if tree is not None:
+            return tree
+
+        tree = getattr(scene, 'compositing_node_group', None)
+        if tree is None:
+            tree = bpy.data.node_groups.new(f"{scene.name}_Compositor", 'CompositorNodeTree')
+            scene.compositing_node_group = tree
+
+            render_layers = tree.nodes.new('CompositorNodeRLayers')
+            render_layers.location = (0, 0)
+
+            composite = tree.nodes.new('CompositorNodeComposite')
+            composite.location = (400, 0)
+
+            viewer = tree.nodes.new('CompositorNodeViewer')
+            viewer.location = (400, -200)
+
+            if render_layers.outputs and composite.inputs:
+                tree.links.new(render_layers.outputs[0], composite.inputs[0])
+            if render_layers.outputs and viewer.inputs:
+                tree.links.new(render_layers.outputs[0], viewer.inputs[0])
+
+        return tree
 
 
     def execute(self, context):
@@ -778,12 +852,15 @@ class MB_OT_ApplyToCompositor(bpy.types.Operator):
             self.report({'ERROR'}, "Addon settings not found.")
             return {'CANCELLED'}
         
-        if not scene.use_nodes:
+        if not getattr(scene, 'use_nodes', False):
             scene.use_nodes = True
             self.report({'INFO'}, "Compositor Nodes enabled.")
-        
-        if not scene.node_tree:
-            self.report({'ERROR'}, "Scene has no compositor node tree.")
+
+        try:
+            tree = self._ensure_compositor_tree(scene)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to create compositor node tree: {e}")
+            traceback.print_exc()
             return {'CANCELLED'}
 
         # Get the base and inverse node names from settings
@@ -804,8 +881,6 @@ class MB_OT_ApplyToCompositor(bpy.types.Operator):
                 self.report({'WARNING'}, "Matrix is not invertible. Using identity for inverse.")
                 inverse_matrix = mathutils.Matrix.Identity(3)
 
-        tree = scene.node_tree
-        
         color_matrix_group = load_and_get_nodegroup()
         if not color_matrix_group:
             self.report({'ERROR'}, "Failed to load 'ColorMatrix' node group. Check console.")
@@ -821,10 +896,38 @@ class MB_OT_ApplyToCompositor(bpy.types.Operator):
         inverse_location = (base_location[0], base_location[1] - 200)
 
         # Create/update the forward and inverse nodes
-        self._create_or_update_matrix_node(context, tree, forward_node_name, forward_matrix, base_location, color_matrix_group)
-        self._create_or_update_matrix_node(context, tree, inverse_node_name, inverse_matrix, inverse_location, color_matrix_group)
+        forward_node = self._create_or_update_matrix_node(context, tree, forward_node_name, forward_matrix, base_location, color_matrix_group)
+        inverse_node = self._create_or_update_matrix_node(context, tree, inverse_node_name, inverse_matrix, inverse_location, color_matrix_group)
 
-        self.report({'INFO'}, f"Set matrix for '{forward_node_name}' and '{inverse_node_name}'.")
+        created_exposure_nodes = []
+        if settings.create_exposure_node and settings.chroma_only:
+            forward_exposure_name = f"{forward_node_name}_Exposure"
+            forward_exposure = self._create_or_update_exposure_node(
+                tree,
+                forward_exposure_name,
+                settings.normalization_factor,
+                (base_location[0] + 260, base_location[1]),
+            )
+            created_exposure_nodes.append(forward_exposure_name)
+            self._link_if_unlinked(tree, forward_node.outputs[0], forward_exposure.inputs[0])
+
+            inverse_exposure_name = f"{inverse_node_name}_Exposure"
+            inverse_factor = 1.0
+            if settings.normalization_factor > 1e-7:
+                inverse_factor = 1.0 / settings.normalization_factor
+            inverse_exposure = self._create_or_update_exposure_node(
+                tree,
+                inverse_exposure_name,
+                inverse_factor,
+                (inverse_location[0] + 260, inverse_location[1]),
+            )
+            created_exposure_nodes.append(inverse_exposure_name)
+            self._link_if_unlinked(tree, inverse_node.outputs[0], inverse_exposure.inputs[0])
+
+        created_suffix = ""
+        if created_exposure_nodes:
+            created_suffix = f" with exposure nodes ({', '.join(created_exposure_nodes)})"
+        self.report({'INFO'}, f"Set matrix for '{forward_node_name}' and '{inverse_node_name}'{created_suffix}.")
         return {'FINISHED'}
 
 class MB_OT_ExportLUT(bpy.types.Operator, ExportHelper):
@@ -1008,10 +1111,6 @@ class MB_PT_CalibratorPanel(bpy.types.Panel):
             box_colorspace = col_input.box()
             box_colorspace.label(text="Sampling Colorspace:")
             box_colorspace.prop(settings.image.colorspace_settings, "name", text="Image")
-            box_colorspace.label(text=f"Display Device: {scene.display_settings.display_device}")
-            box_colorspace.label(text=f"View Transform: {scene.view_settings.view_transform}")
-            for guidance_line in get_image_sampling_guidance(settings.image):
-                box_colorspace.label(text=guidance_line)
 
         row_buttons = col_input.row(align=True)
         set_bg_layout = row_buttons.row(align=True)
@@ -1036,6 +1135,10 @@ class MB_PT_CalibratorPanel(bpy.types.Panel):
         col_calc.operator(MB_OT_CalculateMatrix.bl_idname, text="Calculate Matrix", icon='RENDER_ANIMATION')
         col_calc.separator()
         col_calc.label(text="Apply to Compositor Node:")
+        col_calc.prop(settings, "create_exposure_node")
+        norm_row = col_calc.row(align=True)
+        norm_row.enabled = False
+        norm_row.prop(settings, "normalization_factor", text="Norm Factor")
         row_apply = col_calc.row(align=True)
         row_apply.prop(settings, "node_name", text="")
         apply_op_layout = row_apply.row(align=True)

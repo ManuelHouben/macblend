@@ -325,6 +325,7 @@ def run_calculation(context, operator, helpers):
 
             print("      Block: Normalization...")
             input_samples_normalized = input_samples_raw.copy()
+            settings.normalization_factor = 1.0
             if settings.chroma_only:
                 print("        Normalize Luminance enabled.")
                 neutral_idx = helpers['NEUTRAL_5_INDEX']
@@ -341,6 +342,7 @@ def run_calculation(context, operator, helpers):
                 print(f"          Input Lum (Rec.709): {i_lum:.6f}, Ref Lum ({selected_target}, Rec.709): {r_lum:.6f}")
                 if i_lum > 1e-7:
                     norm_factor = r_lum / i_lum
+                    settings.normalization_factor = float(norm_factor)
                     print(f"          Norm Factor: {norm_factor:.6f}")
                     if abs(norm_factor - 1.0) > 1e-6:
                         input_samples_normalized = input_samples_normalized * norm_factor
