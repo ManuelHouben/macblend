@@ -17,15 +17,25 @@ MACBETH_LINEAR_SRGB_D65_BASE = np.array([
 # CalibrateMacbeth.nk uses Rec.709 luminance coefficients for chroma-only normalization.
 LUMA_COEFFS_REC709 = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
-def sample_image_color(pixels_np, width, height, px, py, sample_size):
+def sample_image_color(pixel_buffer, width, height, px, py, sample_size):
     """Samples average RGB from a NumPy pixel array at (px, py) over a box."""
     fallback_color = (0.0, 0.0, 0.0)
-    
+
     if not (0 <= px < width and 0 <= py < height):
         return fallback_color
 
     if sample_size <= 0:
         sample_size = 1
+
+    if isinstance(pixel_buffer, np.ndarray) and pixel_buffer.ndim == 1:
+        pixels_np = pixel_buffer.reshape((height, width, -1))
+    elif isinstance(pixel_buffer, np.ndarray) and pixel_buffer.ndim == 3:
+        pixels_np = pixel_buffer
+    else:
+        try:
+            pixels_np = np.asarray(pixel_buffer, dtype=np.float32).reshape((height, width, -1))
+        except Exception:
+            return fallback_color
 
     half_size = sample_size // 2
     y_start = max(0, py - half_size)
@@ -34,7 +44,6 @@ def sample_image_color(pixels_np, width, height, px, py, sample_size):
     x_end = min(width, px + half_size + (sample_size % 2))
 
     if y_start >= y_end or x_start >= x_end:
-        # If the sample area is invalid, fall back to a single pixel sample
         safe_py = max(0, min(height - 1, py))
         safe_px = max(0, min(width - 1, px))
         return tuple(pixels_np[safe_py, safe_px, :3])
@@ -44,11 +53,10 @@ def sample_image_color(pixels_np, width, height, px, py, sample_size):
         if sample_region.size > 0:
             average_color = np.mean(sample_region, axis=(0, 1))
             return tuple(average_color)
-        else:
-            # This case should be rare, but acts as a fallback
-            safe_py = max(0, min(height - 1, py))
-            safe_px = max(0, min(width - 1, px))
-            return tuple(pixels_np[safe_py, safe_px, :3])
+
+        safe_py = max(0, min(height - 1, py))
+        safe_px = max(0, min(width - 1, px))
+        return tuple(pixels_np[safe_py, safe_px, :3])
     except Exception as e:
         print(f"Error sampling region at ({px},{py}): {e}")
         return fallback_color
@@ -196,15 +204,7 @@ def run_calculation(context, operator, helpers):
     # Force a dependency graph update to ensure marker positions are current
     context.view_layer.update()
     
-    try:
-        # Get image pixels ONCE and convert to a NumPy array for efficient access.
-        # This is the main performance improvement.
-        img_w, img_h = img.size
-        pixels_np = np.array(img.pixels[:]).reshape((img_h, img_w, 4))
-    except Exception as e:
-        operator.report({'ERROR'}, f"Could not read image pixels: {e}")
-        helpers['traceback'].print_exc()
-        return {'CANCELLED'}
+    pixels_buffer = img.pixels
 
     input_samples_raw = None
     
@@ -253,8 +253,7 @@ def run_calculation(context, operator, helpers):
                 linear_color_rgb = (0.0, 0.0, 0.0)
             else:
                 px, py = coords
-                # Pass the numpy array directly for huge performance gain
-                sampled_color_rgb = sample_image_color(pixels_np, img_w, img_h, px, py, current_sample_size)
+                sampled_color_rgb = sample_image_color(pixels_buffer, img_w, img_h, px, py, current_sample_size)
                 linear_color_rgb = sampled_color_rgb
             
             input_samples_list.append(linear_color_rgb)
