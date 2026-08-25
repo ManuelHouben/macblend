@@ -1,15 +1,15 @@
 # See https://docs.blender.org/api/main/extensions.html
 schema_version = "1.0.0"
 id = "macblend"
-name = "Macbeth Calibrator 3D"
-tagline = "Calibrate colors in your scene using a Macbeth chart"
+name = "Macbeth Calibrator"
+tagline = "Create a Macbeth color calibration matrix from image samples"
 type = "add-on"
 maintainer = "Manuel Houben"
-version = "1.5.1"
+version = "1.6.0"
 blender_version_min = "5.1.0"
-description = "Calculates a color matrix using a Macbeth chart."
-tags = ["Color"]
+description = "Sample Macbeth patch values from the Image Editor and build a calibration transform for Shader and Compositor nodes."
+tags = ["Compositing", "Node"]
 license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
-files = "Read color transform data and export CLF files"
+files = "Read embedded colorspace transform data"

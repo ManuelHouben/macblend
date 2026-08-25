@@ -1,82 +1,70 @@
 # -*- coding: utf-8 -*-
 # <pep8 compliant>
 
-import sys
-
-# --- Imports ---
-import bpy
-from bpy_extras import object_utils
-import math
-import traceback
-import sys
 import json
 import os
-import mathutils
-import subprocess
-import importlib
-from bpy_extras.io_utils import ExportHelper
 
-from . import core
-
-# Import property types directly for Blender 4.x compatibility
+import bpy
 from bpy.props import (
-    StringProperty,
     BoolProperty,
+    EnumProperty,
     FloatProperty,
     FloatVectorProperty,
     PointerProperty,
-    EnumProperty
+    StringProperty,
 )
 
-# --- Constants ---
-MACBETH_PATCH_NAMES = ["dark skin", "light skin", "blue sky", "foliage", "blue flower", "bluish green", "orange", "purplish blue", "moderate red", "purple", "yellow green", "orange yellow", "blue", "green", "red", "yellow", "magenta", "cyan", "white 9.5", "neutral 8", "neutral 6.5", "neutral 5", "neutral 3.5", "black 2"]
-NEUTRAL_5_INDEX = 21
+from . import calibration
+from . import sampling
 
-def srgb_eotf_inverse(c):
-    """Applies the inverse sRGB EOTF to linearize."""
-    if c <= 0.040449936:
-        return c / 12.92
-    else:
-        return ((c + 0.055) / 1.055) ** 2.4
 
-def linearize_color(rgb_tuple):
-    """Applies inverse sRGB EOTF to an entire (R, G, B) tuple."""
-    return (
-        srgb_eotf_inverse(rgb_tuple[0]),
-        srgb_eotf_inverse(rgb_tuple[1]),
-        srgb_eotf_inverse(rgb_tuple[2])
-    )
+_enum_cache = None
+_enum_cache_path = None
 
-def load_json_data(context):
-    """Loads colorspace transform data from JSON specified in preferences, or defaults to bundled file."""
-    prefs = context.preferences.addons[__package__].preferences
-    if hasattr(prefs, 'get_effective_json_path'):
-        json_path = prefs.get_effective_json_path()
-    else:
-        json_path = getattr(prefs, 'json_file_path', None)
-    if not json_path or not os.path.exists(json_path):
-        print(f"JSON Error: Path not set or file not found: '{json_path}'")
+
+def clamp_sample_region(image_size, center_x, center_y, patch_size):
+    """Return a bounded sample rect that stays inside the image pixel bounds.
+
+    The old image-sampling logic in the CCC variant sampled an unbounded box around
+    the patch center. If the overlay was slightly misaligned or the sample center was
+    near an edge, the resulting slice could expand beyond the image bounds and trigger
+    an expensive full-frame average, which locks Blender. Clamping the rect to the
+    image bounds keeps the operation bounded and predictable.
+    """
+    width, height = image_size
+    if width <= 0 or height <= 0:
         return None
-    try:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-        print(f"Successfully loaded JSON data from: '{json_path}'")
-        required_keys = ["sRGB_to_XYZ_matrix", "XYZ_to_RGB_matrices", "whitepoints", "CAT_matrices"]
-        if not all(key in data for key in required_keys):
-            print("JSON Warning: File is missing one or more required keys:", required_keys)
-        return data
-    except Exception as e:
-        print(f"Error loading JSON '{json_path}': {e}")
-        return None
+
+    sample_size = max(1, int(patch_size))
+    if sample_size > max(width, height):
+        sample_size = max(width, height)
+
+    half = sample_size // 2
+    x = int(round(center_x))
+    y = int(round(center_y))
+
+    x0 = max(0, x - half)
+    x1 = min(width, x + half + (sample_size % 2))
+    y0 = max(0, y - half)
+    y1 = min(height, y + half + (sample_size % 2))
+
+    if x0 >= x1:
+        x = max(0, min(width - 1, x))
+        return (x, x + 1, y, y + 1)
+    if y0 >= y1:
+        y = max(0, min(height - 1, y))
+        return (x0, x1, y, y + 1)
+
+    return (x0, x1, y0, y1)
+
 
 def get_image_colorspace_name(image):
-    """Returns the current Blender colorspace name for an image datablock."""
     if not image or not getattr(image, 'colorspace_settings', None):
         return "Unknown"
     return image.colorspace_settings.name
 
+
 def get_image_sampling_guidance(image):
-    """Provides concise guidance for how the selected image colorspace affects calibration sampling."""
     if not image:
         return []
 
@@ -101,260 +89,8 @@ def get_image_sampling_guidance(image):
 
     return guidance
 
-def get_projected_coords(context, camera, obj):
-    """Projects a 3D point to normalized 2D camera coordinates."""
-    if not context or not camera or not obj or not obj.matrix_world or not camera.data:
-        return None
-    try:
-        co_ndc = object_utils.world_to_camera_view(context.scene, camera, obj.matrix_world.translation)
-        return co_ndc
-    except Exception as e:
-        print(f"Error in world_to_camera_view for '{obj.name}': {e}")
-        return None
-
-def get_pixel_coords(norm_coords, image_width, image_height):
-    """Converts normalized 2D camera coordinates to pixel coordinates."""
-    if norm_coords is None or not hasattr(norm_coords, 'x') or not hasattr(norm_coords, 'y'):
-        return None
-    try:
-        if image_width <= 0 or image_height <= 0:
-            return None
-        px = norm_coords.x * image_width
-        py = norm_coords.y * image_height
-        px_clamped = max(0, min(image_width - 1, px))
-        py_clamped = max(0, min(image_height - 1, py))
-        return int(round(px_clamped)), int(round(py_clamped))
-    except Exception as e:
-        print(f"Error converting NDC to pixel coordinates: {e}")
-        return None
-
-def load_and_get_nodegroup(group_name="ColorMatrix"):
-    """
-    Appends a node group from the bundled 'colormatrix.blend' file if it doesn't already exist.
-    """
-    # If the group already exists in the current file, just return it.
-    if group_name in bpy.data.node_groups:
-        print(f"Node group '{group_name}' already exists.")
-        return bpy.data.node_groups[group_name]
-
-    # Construct the path to the bundled .blend file
-    addon_dir = os.path.dirname(os.path.abspath(__file__))
-    blend_file_path = os.path.join(addon_dir, "colormatrix.blend")
-
-    if not os.path.exists(blend_file_path):
-        print(f"ERROR: Bundled file 'colormatrix.blend' not found at '{blend_file_path}'")
-        return None
-
-    # Append the node group from the .blend file.
-    try:
-        with bpy.data.libraries.load(blend_file_path, link=False) as (data_from, data_to):
-            if group_name in data_from.node_groups:
-                data_to.node_groups = [group_name]
-            else:
-                print(f"ERROR: Node group '{group_name}' not found inside '{blend_file_path}'")
-                return None
-    except Exception as e:
-        print(f"ERROR: Failed to load library from '{blend_file_path}': {e}")
-        return None
-
-    # The appended group should now be in bpy.data.node_groups
-    appended_group = bpy.data.node_groups.get(group_name)
-    if appended_group:
-        print(f"Successfully appended node group '{group_name}'.")
-    else:
-        print(f"ERROR: Failed to append node group '{group_name}' for an unknown reason.")
-
-    return appended_group
-
-# --- UI and Logic Functions ---
-def update_marker_geometry(scene):
-    """
-    Updates the geometry of the shared marker curve based on the 'sample_size'
-    percentage and the current dimensions and rotation of the control rig.
-    """
-    if not scene or not hasattr(scene, 'macbeth_calibrator_settings'):
-        return
-
-    settings = scene.macbeth_calibrator_settings
-    
-    marker_curve = bpy.data.curves.get("MB_Sample_Marker_Curve")
-    if not marker_curve or not marker_curve.splines:
-        return
-
-    corner_tl = settings.corner_tl
-    corner_tr = settings.corner_tr
-    corner_bl = settings.corner_bl
-    corner_br = settings.corner_br
-    if not all((corner_tl, corner_tr, corner_bl, corner_br)):
-        return
-
-    p_tl = corner_tl.matrix_world.translation
-    p_tr = corner_tr.matrix_world.translation
-    p_bl = corner_bl.matrix_world.translation
-    p_br = corner_br.matrix_world.translation
-
-    # Calculate edge vectors and average lengths
-    top_vec = p_tr - p_tl
-    left_vec = p_bl - p_tl
-    
-    avg_width = (top_vec.length + (p_br - p_bl).length) / 2.0
-    avg_height = (left_vec.length + (p_br - p_tr).length) / 2.0
-
-    cell_width = avg_width / 6.0
-    cell_height = avg_height / 4.0
-    
-    max_radius = 0.5 * min(cell_width, cell_height)
-    half_side = max_radius * (settings.sample_size / 100.0)
-
-    # Construct a rotation matrix from the rig's edge vectors
-    x_axis = top_vec.normalized()
-    y_axis = left_vec.normalized()
-    z_axis = x_axis.cross(y_axis).normalized()
-    # Create a new y_axis perpendicular to x and z for a clean orthonormal matrix
-    y_axis_perp = z_axis.cross(x_axis).normalized()
-    
-    # Final rotation matrix for the rig
-    rot_matrix = mathutils.Matrix((x_axis, y_axis_perp, z_axis)).transposed()
-
-    # Define vertices for an axis-aligned square
-    points_co_local = [
-        mathutils.Vector((-half_side, -half_side, 0)),
-        mathutils.Vector(( half_side, -half_side, 0)),
-        mathutils.Vector(( half_side,  half_side, 0)),
-        mathutils.Vector((-half_side,  half_side, 0)),
-    ]
-    
-    # Rotate the local square vertices by the rig's rotation matrix
-    points_co_rotated = [rot_matrix @ p for p in points_co_local]
-    
-    spline = marker_curve.splines[0]
-    
-    # Set the coordinates and handle types for each point to form a rotated square
-    for i, p in enumerate(spline.bezier_points):
-        p.co = points_co_rotated[i]
-        p.handle_left = points_co_rotated[i]
-        p.handle_right = points_co_rotated[i]
-        p.handle_left_type = 'VECTOR'
-        p.handle_right_type = 'VECTOR'
-
-def update_marker_positions(scene):
-    """
-    Calculates and sets the positions of the 24 sample markers based on the
-    locations of the four corner controller objects using bilinear interpolation.
-    """
-    if not scene or not hasattr(scene, 'macbeth_calibrator_settings'):
-        return
-
-    settings = scene.macbeth_calibrator_settings
-    
-    # Retrieve the four corner controller objects from the settings
-    corner_tl = settings.corner_tl
-    corner_tr = settings.corner_tr
-    corner_bl = settings.corner_bl
-    corner_br = settings.corner_br
-    
-    # Exit if any of the corner controllers are not assigned
-    if not all((corner_tl, corner_tr, corner_bl, corner_br)):
-        return
-
-    # Find the collection containing the markers
-    marker_collection = bpy.data.collections.get(settings.marker_collection_name)
-    if not marker_collection:
-        return
-
-    # Get the sample markers and sort them numerically to ensure correct order.
-    markers = [obj for obj in marker_collection.objects if obj.name.startswith("MB_Sample_")]
-    if len(markers) != 24:
-        return
-    try:
-        markers.sort(key=lambda obj: int(obj.name.split('_')[2]))
-    except (IndexError, ValueError):
-        # This can happen if the rig is cleared and this function runs before it's fully rebuilt.
-        return
-
-
-    # Get the world-space locations of the corner controllers
-    p_tl = corner_tl.matrix_world.translation
-    p_tr = corner_tr.matrix_world.translation
-    p_bl = corner_bl.matrix_world.translation
-    p_br = corner_br.matrix_world.translation
-
-    num_cols = 6
-    num_rows = 4
-    patch_index = 0
-
-    # Iterate through each row and column of the grid.
-    # The corner controllers are expected to be on the outer corners of the chart.
-    # The interpolation is adjusted to find the center of each patch.
-    for r in range(num_rows):
-        # Calculate v to find the vertical center of the current row's area.
-        v = (r + 0.5) / num_rows
-        
-        # Interpolate the left and right edges of the current row.
-        p_left = p_tl.lerp(p_bl, v)
-        p_right = p_tr.lerp(p_br, v)
-
-        for c in range(num_cols):
-            # Calculate u to find the horizontal center of the current column's area.
-            u = (c + 0.5) / num_cols
-            
-            # Interpolate across the row to find the marker's final position at the patch center.
-            pos = p_left.lerp(p_right, u)
-
-            if patch_index < len(markers):
-                # Use a non-blocking check to avoid infinite loops with the handler
-                if (markers[patch_index].location - pos).length > 1e-6:
-                    markers[patch_index].location = pos
-            
-            patch_index += 1
-
-# This flag is used to prevent the handler from running recursively
-_handler_is_running = False
-
-def macbeth_depsgraph_handler(scene, depsgraph):
-    """
-    An application handler that runs after the dependency graph is updated.
-    It checks if one of the control corners was moved and, if so,
-    triggers an update of the sample marker positions.
-    """
-    global _handler_is_running
-    if _handler_is_running:
-        return
-
-    if not hasattr(scene, 'macbeth_calibrator_settings'):
-        return
-        
-    settings = scene.macbeth_calibrator_settings
-    controllers = [settings.corner_tl, settings.corner_tr, settings.corner_bl, settings.corner_br]
-    
-    # Don't run if the rig is not fully set up
-    if not all(controllers):
-        return
-
-    controller_names = {c.name for c in controllers}
-    
-    # Check if any of the updated objects are one of our controllers
-    needs_update = False
-    for update in depsgraph.updates:
-        if update.id.name in controller_names and update.is_updated_transform:
-            needs_update = True
-            break
-    
-    if needs_update:
-        # Set the flag to prevent recursion and run the update
-        _handler_is_running = True
-        try:
-            update_marker_positions(scene)
-            update_marker_geometry(scene)
-        finally:
-            _handler_is_running = False
-
-# --- Enum Callback ---
-_enum_cache = None
-_enum_cache_path = None
 
 def get_target_colorspace_items(self, context):
-    """Dynamically populates the target colorspace EnumProperty."""
     global _enum_cache, _enum_cache_path
     items = [("LINEAR_SRGB_D65", "Linear sRGB D65 (Internal)", "Use the internal Linear sRGB D65 reference values")]
 
@@ -391,27 +127,25 @@ def get_target_colorspace_items(self, context):
         _enum_cache = items
         _enum_cache_path = json_path
         return items
-
-    except Exception as e:
-        print(f"ERROR (Enum Callback): {e}")
-        traceback.print_exc()
+    except Exception:
         return items
 
-# --- Classes ---
+
 class MacbethCalibratorPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
-    
+
     json_file_path: StringProperty(
         name="Colorspace JSON File",
         description="Path to the JSON file containing colorspace transform data. If left empty, the default bundled file will be used.",
         subtype='FILE_PATH',
-        default=""
+        default="",
     )
 
     def get_effective_json_path(self):
         user_path = self.json_file_path
         if user_path and os.path.exists(user_path):
             return user_path
+
         addon_dir = os.path.dirname(os.path.abspath(__file__))
         bundled_path = os.path.join(addon_dir, "mmColorTarget_colorspace_transforms.json")
         if os.path.exists(bundled_path):
@@ -432,45 +166,29 @@ class MacbethCalibratorPreferences(bpy.types.AddonPreferences):
             box = layout.box()
             box.label(text="Warning: No valid JSON file found.", icon='ERROR')
 
+
 class MacbethCalibratorSettings(bpy.types.PropertyGroup):
-    cam: PointerProperty(
-        name="Camera",
-        type=bpy.types.Object,
-        poll=lambda self, obj: obj.type == 'CAMERA'
-    )
-    image: PointerProperty(
-        name="Input Image",
-        type=bpy.types.Image
-    )
-    sample_size: FloatProperty(
-        name="Marker Size",
-        description="Size of the sample markers as a percentage of the available space for each patch",
-        subtype='PERCENTAGE',
-        default=50.0,
-        min=1.0,
-        max=100.0,
-        update=lambda self, context: update_marker_geometry(context.scene)
-    )
-    chroma_only: BoolProperty(
-        name="Normalize Luminance",
-        description="Adjust source samples to match TARGET grey luminance before matrix calculation",
-        default=True
+    sample_source_image: PointerProperty(
+        name="Source Image",
+        description="Saved Macbeth chart calibration data to use when creating the transform",
+        type=bpy.types.Image,
+        poll=lambda self, obj: obj is not None and getattr(obj, 'mb_sample_data', None) is not None and obj.mb_sample_data.is_saved,
     )
     create_exposure_node: BoolProperty(
         name="Create Exposure Node",
-        description="Create a separate Multiply node in the compositor to apply the luminance compensation implied by chroma-only calibration",
-        default=True
+        description="Normalize the matrix and insert a matching exposure/scale node when checked; leave the raw matrix when unchecked.",
+        default=True,
     )
     normalization_factor: FloatProperty(
         name="Normalization Factor",
         description="Stored luminance compensation factor from the last matrix calculation",
         default=1.0,
-        min=0.0
+        min=0.0,
     )
     debug_parity_logging: BoolProperty(
         name="Debug Parity Logging",
-        description="Print sampled input patches and additional parity diagnostics to the console for Nuke comparison",
-        default=False
+        description="Print sampled input patches and additional parity diagnostics to the console for comparison.",
+        default=False,
     )
     target_colorspace: EnumProperty(
         name="Target Colorspace",
@@ -482,722 +200,76 @@ class MacbethCalibratorSettings(bpy.types.PropertyGroup):
         description="Internal storage of the calculated 3x3 matrix (row-major)",
         size=9,
         subtype='MATRIX',
-        default=[1,0,0, 0,1,0, 0,0,1]
+        default=[1, 0, 0, 0, 1, 0, 0, 0, 1],
     )
     calculation_done: BoolProperty(
         name="Calculation Done Flag",
         description="Indicates if a matrix has been successfully calculated",
-        default=False
+        default=False,
     )
     matrix_display_string: StringProperty(
         name="Formatted Matrix",
         description="User-friendly display of the calculated matrix",
-        default="Matrix not calculated."
+        default="Matrix not calculated.",
     )
     node_name: StringProperty(
         name="Node Name",
-        description="Name for the Color Balance node in the compositor",
-        default="MacbethCalibration"
-    )
-    marker_collection_name: StringProperty(
-        name="Rig Collection",
-        description="Name of the collection holding the sample markers and controllers",
-        default="Macbeth Control Rig"
-    )
-    # --- Corner Controllers for the Rig ---
-    corner_tl: PointerProperty(
-        name="Top-Left Corner",
-        type=bpy.types.Object
-    )
-    corner_tr: PointerProperty(
-        name="Top-Right Corner",
-        type=bpy.types.Object
-    )
-    corner_bl: PointerProperty(
-        name="Bottom-Left Corner",
-        type=bpy.types.Object
-    )
-    corner_br: PointerProperty(
-        name="Bottom-Right Corner",
-        type=bpy.types.Object
+        description="Base name for the generated forward and inverse matrix nodes",
+        default="MacbethCalibration",
     )
 
-# --- Operators ---
-class MB_OT_SetupSampleMarkers(bpy.types.Operator):
-    """Creates or replaces a controllable grid of 24 markers and 4 corner empties"""
-    bl_idname = "mbcalib.setup_sample_markers"
-    bl_label = "Setup Control Rig"
-    bl_options = {'REGISTER', 'UNDO'}
 
-    collection_name: StringProperty(name="Rig Collection Name", default="Macbeth Control Rig")
-    controller_size: FloatProperty(name="Controller Size", default=0.1, min=0.01)
-
-    @classmethod
-    def poll(cls, context):
-        return context.scene is not None
-
-    def execute(self, context):
-        scene = context.scene
-        view_layer = context.view_layer
-        settings = scene.macbeth_calibrator_settings
-        
-        base_name = "Macbeth Control Rig"
-        image_name_part = ""
-        if settings.image and settings.image.name:
-            image_name_part = f" ({settings.image.name})"
-        
-        final_collection_name = f"{base_name}{image_name_part}"
-        settings.marker_collection_name = final_collection_name
-
-        rig_collection = bpy.data.collections.get(final_collection_name)
-        if not rig_collection:
-            rig_collection = bpy.data.collections.new(final_collection_name)
-            scene.collection.children.link(rig_collection)
-            print(f"Created collection: '{final_collection_name}'")
-        else:
-            print(f"Found existing collection: '{final_collection_name}'")
-            objects_to_delete = [obj for obj in rig_collection.objects]
-            for obj in objects_to_delete:
-                    bpy.data.objects.remove(obj, do_unlink=True)
-            print(f"Cleared {len(objects_to_delete)} objects from rig collection.")
-
-        # Cleanup old data-blocks to prevent file bloat
-        old_curve = bpy.data.curves.get("MB_Sample_Marker_Curve")
-        if old_curve:
-            bpy.data.curves.remove(old_curve)
-
-        original_active = view_layer.objects.active
-        original_selected = context.selected_objects[:]
-        bpy.ops.object.select_all(action='DESELECT')
-
-        try:
-            cursor_loc = scene.cursor.location
-            
-            # --- Create Corner Controllers ---
-            width, height = 1.2, 0.8
-            corner_locations = {
-                "TL": cursor_loc + mathutils.Vector((-width/2, height/2, 0)),
-                "TR": cursor_loc + mathutils.Vector((width/2, height/2, 0)),
-                "BL": cursor_loc + mathutils.Vector((-width/2, -height/2, 0)),
-                "BR": cursor_loc + mathutils.Vector((width/2, -height/2, 0)),
-            }
-
-            def create_empty(name, location, size, collection):
-                obj = bpy.data.objects.new(name, None)
-                obj.location = location
-                obj.empty_display_size = size
-                obj.empty_display_type = 'SPHERE'
-                collection.objects.link(obj)
-                return obj
-
-            settings.corner_tl = create_empty("MB_Corner_TL", corner_locations["TL"], self.controller_size, rig_collection)
-            settings.corner_tr = create_empty("MB_Corner_TR", corner_locations["TR"], self.controller_size, rig_collection)
-            settings.corner_bl = create_empty("MB_Corner_BL", corner_locations["BL"], self.controller_size, rig_collection)
-            settings.corner_br = create_empty("MB_Corner_BR", corner_locations["BR"], self.controller_size, rig_collection)
-            print("Created 4 corner controllers.")
-            
-            # FORCE an update of the dependency graph so the new objects have their matrices.
-            context.view_layer.update()
-
-            # --- Create Sample Markers using CURVE objects ---
-            marker_curve = bpy.data.curves.new("MB_Sample_Marker_Curve", type='CURVE')
-            marker_curve.dimensions = '2D'
-            spline = marker_curve.splines.new('BEZIER')
-            spline.bezier_points.add(3) # A new bezier spline has 1 point, add 3 more for a total of 4
-            spline.use_cyclic_u = True
-
-
-            for i in range(24):
-                patch_name = MACBETH_PATCH_NAMES[i]
-                obj_name_suffix = patch_name.replace(" ", "_").replace(".", "").replace("(", "").replace(")", "")
-                marker_obj_name = f"MB_Sample_{i + 1:02d}_{obj_name_suffix}"
-                
-                marker_obj = bpy.data.objects.new(marker_obj_name, marker_curve)
-                marker_obj.show_name = False
-                rig_collection.objects.link(marker_obj)
-            print("Created 24 sample markers (curve objects).")
-
-            # Run the update function to set initial positions and geometry
-            update_marker_positions(scene)
-            update_marker_geometry(scene)
-
-        finally:
-            # Restore original selection and active object
-            bpy.ops.object.select_all(action='DESELECT')
-            for obj in original_selected:
-                if obj and obj.name in view_layer.objects:
-                    obj.select_set(True)
-            if original_active and original_active.name in view_layer.objects:
-                view_layer.objects.active = original_active
-
-        self.report({'INFO'}, f"Created control rig in collection '{final_collection_name}'.")
-        return {'FINISHED'}
-
-class MB_OT_SetBackground(bpy.types.Operator):
-    """Sets the selected image as the background for the selected camera"""
-    bl_idname = "mbcalib.set_background"
-    bl_label = "Set Camera Background"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        settings = context.scene.macbeth_calibrator_settings
-        return settings and settings.cam and settings.image
-
-    def execute(self, context):
-        settings = context.scene.macbeth_calibrator_settings
-        cam = settings.cam
-        img = settings.image
-        if not cam or cam.type != 'CAMERA':
-            self.report({'ERROR'}, "No valid Camera selected.")
-            return {'CANCELLED'}
-        if not img:
-            self.report({'ERROR'}, "No Input Image selected.")
-            return {'CANCELLED'}
-        try:
-            cam_data = cam.data
-            
-            if hasattr(cam_data, 'show_background_images'):
-                cam_data.show_background_images = True
-            else:
-                self.report({'WARNING'}, "Camera data missing 'show_background_images'.")
-
-            if not hasattr(cam_data, 'background_images'):
-                self.report({'ERROR'}, "Camera data missing 'background_images'.")
-                return {'CANCELLED'}
-
-            # Clear all existing background images to ensure a clean slate
-            cam_data.background_images.clear()
-            print("Cleared all existing background images.")
-            
-            # Add the new background image
-            if hasattr(cam_data.background_images, 'new'):
-                bg_image_entry = cam_data.background_images.new()
-                bg_image_entry.image = img
-                print(f"Added new BG for '{img.name}'.")
-            else:
-                self.report({'ERROR'}, "Cannot add new BG entry.")
-                return {'CANCELLED'}
-
-            # Configure the new background image
-            if bg_image_entry:
-                bg_image_entry.alpha = 1.0
-                if hasattr(bg_image_entry, 'display_depth'):
-                    bg_image_entry.display_depth = 'BACK'
-                else:
-                    self.report({'WARNING'}, "BG entry missing 'display_depth'.")
-                self.report({'INFO'}, f"Set '{img.name}' as the only background image for camera '{cam.name}'.")
-            else:
-                self.report({'ERROR'}, "Failed get/create BG entry.")
-                return {'CANCELLED'}
-
-        except AttributeError as ae:
-            self.report({'ERROR'}, f"Camera data attribute error: {ae}.")
-            traceback.print_exc()
-            return {'CANCELLED'}
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to set background image: {e}")
-            traceback.print_exc()
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
-class MB_OT_CalculateMatrix(bpy.types.Operator):
-    """Samples colors from the image using markers and calculates the calibration matrix"""
-    bl_idname = "mbcalib.calculate_matrix"
-    bl_label = "Calculate Color Matrix"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        settings = context.scene.macbeth_calibrator_settings
-        if not (settings and settings.cam and settings.image and settings.image.has_data):
-            return False
-
-        marker_collection = bpy.data.collections.get(settings.marker_collection_name)
-        if not marker_collection:
-            return False
-        
-        # Only count the actual sample markers, not the controllers
-        markers = [o for o in marker_collection.objects if o.name.startswith("MB_Sample_")]
-        return len(markers) >= 24
-
-    def execute(self, context):
-        # This dictionary passes non-numpy-dependent helper functions and data
-        # to the core module to avoid circular imports.
-        helpers = {
-            'bpy': bpy,
-            'traceback': traceback,
-            'load_json_data': load_json_data,
-            'get_projected_coords': get_projected_coords,
-            'get_pixel_coords': get_pixel_coords,
-            'get_image_colorspace_name': get_image_colorspace_name,
-            'linearize_color': linearize_color,
-            'MACBETH_PATCH_NAMES': MACBETH_PATCH_NAMES,
-            'NEUTRAL_5_INDEX': NEUTRAL_5_INDEX
-        }
-        
-        return core.run_calculation(context, self, helpers)
-
-class MB_OT_ApplyToCompositor(bpy.types.Operator):
-    """Applies the calculated matrix to a Color Balance node in the compositor"""
-    bl_idname = "mbcalib.apply_to_compositor"
-    bl_label = "Apply Matrix to Compositor"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        scene = context.scene
-        return scene and hasattr(scene, 'macbeth_calibrator_settings')
-
-    def _create_or_update_matrix_node(self, context, tree, node_name, matrix, location, group_definition):
-        """Helper to create or update a single ColorMatrix node group instance."""
-        # Build explicit row-major values by index to avoid iteration-order ambiguity
-        # with mathutils.Matrix in newer Blender versions.
-        try:
-            m00 = float(matrix[0][0]); m01 = float(matrix[0][1]); m02 = float(matrix[0][2])
-            m10 = float(matrix[1][0]); m11 = float(matrix[1][1]); m12 = float(matrix[1][2])
-            m20 = float(matrix[2][0]); m21 = float(matrix[2][1]); m22 = float(matrix[2][2])
-        except Exception:
-            # Fallback path for flat/list-like matrices
-            matrix_values = [float(v) for row in matrix for v in row]
-            if len(matrix_values) != 9:
-                raise ValueError(f"Expected 9 matrix values, got {len(matrix_values)}")
-            m00, m01, m02, m10, m11, m12, m20, m21, m22 = matrix_values
-
-        node = tree.nodes.get(node_name)
-        if node and node.bl_idname != 'CompositorNodeGroup':
-            tree.nodes.remove(node)
-            node = None
-        
-        if not node:
-            node = tree.nodes.new(type='CompositorNodeGroup')
-            node.name = node_name
-            node.location = location
-        node.label = node_name
-        
-        node.node_tree = group_definition
-        
-        context.view_layer.update()
-        
-        try:
-            # Nuke-style transposed matrix convention:
-            # row 1 -> Red coefficients, row 2 -> Green, row 3 -> Blue.
-            if 'Output Red' in node.inputs:
-                node.inputs['Output Red'].default_value = (m00, m10, m20)
-            if 'Output Green' in node.inputs:
-                node.inputs['Output Green'].default_value = (m01, m11, m21)
-            if 'Output Blue' in node.inputs:
-                node.inputs['Output Blue'].default_value = (m02, m12, m22)
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to set matrix on '{node.name}': {e}")
-            traceback.print_exc()
-
-        return node
-
-    def _create_or_update_exposure_node(self, tree, node_name, factor, location):
-        """Helper to create or update an Exposure node used for luminance compensation."""
-        node = tree.nodes.get(node_name)
-        if node and node.bl_idname != 'CompositorNodeExposure':
-            tree.nodes.remove(node)
-            node = None
-
-        if not node:
-            node = tree.nodes.new(type='CompositorNodeExposure')
-            node.name = node_name
-            node.location = location
-
-        node.label = node_name
-        safe_factor = max(float(factor), 1e-8)
-        node.inputs[1].default_value = math.log2(safe_factor)
-        return node
-
-    def _link_if_unlinked(self, tree, from_socket, to_socket):
-        """Create a compositor link only when the destination is not already linked."""
-        if from_socket is None or to_socket is None or to_socket.is_linked:
-            return
-        tree.links.new(from_socket, to_socket)
-
-    def _ensure_compositor_tree(self, scene):
-        """Get or create a compositor node tree compatible with current Blender API."""
-        tree = getattr(scene, 'node_tree', None)
-        if tree is not None:
-            return tree
-
-        tree = getattr(scene, 'compositing_node_group', None)
-        if tree is None:
-            tree = bpy.data.node_groups.new(f"{scene.name}_Compositor", 'CompositorNodeTree')
-            scene.compositing_node_group = tree
-
-            render_layers = tree.nodes.new('CompositorNodeRLayers')
-            render_layers.location = (0, 0)
-
-            composite = tree.nodes.new('CompositorNodeComposite')
-            composite.location = (400, 0)
-
-            viewer = tree.nodes.new('CompositorNodeViewer')
-            viewer.location = (400, -200)
-
-            if render_layers.outputs and composite.inputs:
-                tree.links.new(render_layers.outputs[0], composite.inputs[0])
-            if render_layers.outputs and viewer.inputs:
-                tree.links.new(render_layers.outputs[0], viewer.inputs[0])
-
-        return tree
-
-
-    def execute(self, context):
-        settings = context.scene.macbeth_calibrator_settings
-        scene = context.scene
-        if not settings:
-            self.report({'ERROR'}, "Addon settings not found.")
-            return {'CANCELLED'}
-        
-        if not getattr(scene, 'use_nodes', False):
-            scene.use_nodes = True
-            self.report({'INFO'}, "Compositor Nodes enabled.")
-
-        try:
-            tree = self._ensure_compositor_tree(scene)
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to create compositor node tree: {e}")
-            traceback.print_exc()
-            return {'CANCELLED'}
-
-        # Get the base and inverse node names from settings
-        forward_node_name = settings.node_name
-        inverse_node_name = f"{forward_node_name}_Inverse"
-
-        forward_matrix = mathutils.Matrix.Identity(3)
-        inverse_matrix = mathutils.Matrix.Identity(3)
-
-        if not settings.calculation_done:
-            self.report({'WARNING'}, "Matrix not calculated. Applying identity matrices.")
-        else:
-            forward_matrix = settings.calculated_matrix.copy()
-            inverse_matrix = forward_matrix.copy()
-            try:
-                inverse_matrix.invert()
-            except ValueError:
-                self.report({'WARNING'}, "Matrix is not invertible. Using identity for inverse.")
-                inverse_matrix = mathutils.Matrix.Identity(3)
-
-        color_matrix_group = load_and_get_nodegroup()
-        if not color_matrix_group:
-            self.report({'ERROR'}, "Failed to load 'ColorMatrix' node group. Check console.")
-            return {'CANCELLED'}
-        
-        # Determine node locations
-        render_layers = tree.nodes.get('Render Layers')
-        if render_layers:
-            base_location = (render_layers.location.x + 350, render_layers.location.y)
-        else:
-            base_location = (200, 400)
-        
-        inverse_location = (base_location[0], base_location[1] - 200)
-
-        # Create/update the forward and inverse nodes
-        forward_node = self._create_or_update_matrix_node(context, tree, forward_node_name, forward_matrix, base_location, color_matrix_group)
-        inverse_node = self._create_or_update_matrix_node(context, tree, inverse_node_name, inverse_matrix, inverse_location, color_matrix_group)
-
-        created_exposure_nodes = []
-        if settings.create_exposure_node and settings.chroma_only:
-            forward_exposure_name = f"{forward_node_name}_Exposure"
-            forward_exposure = self._create_or_update_exposure_node(
-                tree,
-                forward_exposure_name,
-                settings.normalization_factor,
-                (base_location[0] + 260, base_location[1]),
-            )
-            created_exposure_nodes.append(forward_exposure_name)
-            self._link_if_unlinked(tree, forward_node.outputs[0], forward_exposure.inputs[0])
-
-            inverse_exposure_name = f"{inverse_node_name}_Exposure"
-            inverse_factor = 1.0
-            if settings.normalization_factor > 1e-7:
-                inverse_factor = 1.0 / settings.normalization_factor
-            inverse_exposure = self._create_or_update_exposure_node(
-                tree,
-                inverse_exposure_name,
-                inverse_factor,
-                (inverse_location[0] + 260, inverse_location[1]),
-            )
-            created_exposure_nodes.append(inverse_exposure_name)
-            self._link_if_unlinked(tree, inverse_node.outputs[0], inverse_exposure.inputs[0])
-
-        created_suffix = ""
-        if created_exposure_nodes:
-            created_suffix = f" with exposure nodes ({', '.join(created_exposure_nodes)})"
-        self.report({'INFO'}, f"Set matrix for '{forward_node_name}' and '{inverse_node_name}'{created_suffix}.")
-        return {'FINISHED'}
-
-class MB_OT_ExportLUT(bpy.types.Operator, ExportHelper):
-    """Exports the calculated matrix to a .cube LUT file"""
-    bl_idname = "mbcalib.export_lut"
-    bl_label = "Export Matrix as LUT (.cube)"
-    bl_options = {'REGISTER'}
-    
-    filename_ext = ".cube"
-    filter_glob: StringProperty(
-        default="*.cube",
-        options={'HIDDEN'},
-        maxlen=255,
-    )
-    
-    lut_size: EnumProperty(
-        name="LUT Size",
-        description="Size of the 3D LUT cube. Larger sizes are more accurate but create larger files",
-        items=[
-            ('17', "17×17×17", "Small LUT (17³ = 4,913 samples, ~144 KB)"),
-            ('33', "33×33×33", "Standard LUT (33³ = 35,937 samples, ~1 MB)"),
-            ('65', "65×65×65", "High Quality LUT (65³ = 274,625 samples, ~8 MB)"),
-        ],
-        default='33',
-    )
-    
-    linear_only: BoolProperty(
-        name="Linear Space Only",
-        description="Export a linear LUT (no transfer function). The LUT operates on linear RGB values. "
-                   "If disabled, the LUT would include transfer function conversion (not yet implemented)",
-        default=True,
-    )
-    
-    @classmethod
-    def poll(cls, context):
-        if not context or not context.scene or not hasattr(context.scene, 'macbeth_calibrator_settings'):
-            return False
-        settings = context.scene.macbeth_calibrator_settings
-        return settings and settings.calculation_done
-    
-    def invoke(self, context, event):
-        context.window_manager.fileselect_add(self)
-        return {'RUNNING_MODAL'}
-    
-    def execute(self, context):
-        import numpy as np
-        settings = context.scene.macbeth_calibrator_settings
-        
-        # Get matrix from settings
-        matrix = settings.calculated_matrix
-        if isinstance(matrix, mathutils.Matrix):
-            # Convert mathutils.Matrix to numpy array
-            matrix_np = np.array([list(row) for row in matrix], dtype=np.float32)
-        else:
-            # Assume it's already a list/array, reshape to 3x3
-            matrix_flat = list(matrix)
-            if len(matrix_flat) != 9:
-                self.report({'ERROR'}, f"Invalid matrix size: {len(matrix_flat)}")
-                return {'CANCELLED'}
-            matrix_np = np.array(matrix_flat, dtype=np.float32).reshape(3, 3)
-        
-        # Convert matrix to LUT
-        lut_size = int(self.lut_size)
-        try:
-            lut_data = core.matrix_to_lut(matrix_np, lut_size)
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to generate LUT: {e}")
-            import traceback
-            traceback.print_exc()
-            return {'CANCELLED'}
-        
-        # Get colorspace information for metadata
-        input_desc = "Linear Rec.709 (sRGB)"
-        output_desc = settings.target_colorspace
-        if output_desc == 'LINEAR_SRGB_D65':
-            output_desc = "Linear Rec.709 (sRGB)"
-        
-        # Try to get whitepoint from JSON
-        target_whitepoint = 'D65'  # default
-        try:
-            json_data = load_json_data(context)
-            if json_data and output_desc in json_data.get("whitepoints", {}):
-                target_whitepoint = json_data["whitepoints"][output_desc]
-        except Exception:
-            pass  # Use default if JSON loading fails
-        
-        # Determine if this is a linear-only LUT
-        lut_type_note = ""
-        if self.linear_only:
-            lut_type_note = (
-                "This is a LINEAR LUT. It operates on linear RGB values.\n"
-                "# Input and output are both in linear space.\n"
-                "# No transfer function (gamma/log) conversion is applied.\n"
-                "# Use this when your application handles transfer functions separately."
-            )
-        else:
-            lut_type_note = (
-                "NOTE: Transfer function conversion is not yet implemented.\n"
-                "# This LUT currently operates in linear space."
-            )
-        
-        # Generate .cube file content
-        cube_lines = [
-            f"TITLE \"Macbeth Calibrator Matrix Export\"",
-            f"",
-            f"# Generated by Macbeth Calibrator 3D",
-            f"#",
-            f"# TRANSFORM INFORMATION:",
-            f"#   Input Colorspace: {input_desc}",
-            f"#   Output Colorspace: {output_desc}",
-            f"#   Output Whitepoint: {target_whitepoint}",
-            f"#   LUT Size: {lut_size}×{lut_size}×{lut_size}",
-            f"#",
-            f"# LUT TYPE:",
-            f"# {lut_type_note}",
-            f"#",
-            f"# The matrix transform is sampled across the RGB cube.",
-            f"# Values are clamped to [0.0, 1.0] range.",
-            f"",
-            f"LUT_3D_SIZE {lut_size}",
-            f"DOMAIN_MIN 0.0 0.0 0.0",
-            f"DOMAIN_MAX 1.0 1.0 1.0",
-            f"",
-        ]
-        
-        # Write LUT data - .cube format expects R G B per line
-        # Swap R and B channels in output to fix red/blue channel swap issue
-        # Some .cube readers may interpret channels differently
-        for i in range(lut_data.shape[0]):
-            r, g, b = lut_data[i]
-            # Swap R and B: write as B G R instead of R G B
-            cube_lines.append(f"{b:.6f} {g:.6f} {r:.6f}")
-        
-        cube_content = "\n".join(cube_lines)
-        
-        # Write file
-        try:
-            with open(self.filepath, 'w', encoding='utf-8') as f:
-                f.write(cube_content)
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to write file: {e}")
-            return {'CANCELLED'}
-        
-        lut_type_str = "Linear" if self.linear_only else "With Transfer"
-        self.report({'INFO'}, f"Exported {lut_size}³ {lut_type_str} LUT to {self.filepath}")
-        return {'FINISHED'}
-
-# --- UI Panel ---
-class MB_PT_CalibratorPanel(bpy.types.Panel):
-    """Creates the UI Panel in the 3D View Sidebar"""
-    bl_label = "Macbeth Calibrator"
-    bl_idname = "MB_PT_CalibratorPanel"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Macbeth'
-
-    def draw(self, context):
-        layout = self.layout
-        settings = None
-        try:
-            scene = context.scene
-            if not hasattr(scene, 'macbeth_calibrator_settings'):
-                layout.label(text="Error: Settings property missing.", icon='ERROR')
-                return
-            settings = scene.macbeth_calibrator_settings
-            if settings is None:
-                layout.label(text="Error: Settings property is None.", icon='ERROR')
-                return
-        except Exception as e:
-            layout.label(text=f"Panel Draw Error: {e}", icon='ERROR')
-            return
-
-        layout.label(text="1. Input Setup:")
-        box_input = layout.box()
-        col_input = box_input.column()
-
-        col_input.prop(settings, "cam", text="Camera")
-        col_input.prop(settings, "image", text="Image")
-
-        if settings.image and getattr(settings.image, 'colorspace_settings', None):
-            box_colorspace = col_input.box()
-            box_colorspace.label(text="Sampling Colorspace:")
-            box_colorspace.prop(settings.image.colorspace_settings, "name", text="Image")
-
-        row_buttons = col_input.row(align=True)
-        set_bg_layout = row_buttons.row(align=True)
-        set_bg_layout.operator(MB_OT_SetBackground.bl_idname, text="Set BG")
-        row_buttons.operator(MB_OT_SetupSampleMarkers.bl_idname, text="Setup Control Rig")
-        col_input.prop(settings, "marker_collection_name", text="Rig Collection")
-
-        layout.separator()
-        layout.label(text="2. Calibration Settings:")
-        box_settings = layout.box()
-        col_settings = box_settings.column()
-        col_settings.prop(settings, "target_colorspace", text="Target")
-        col_settings.separator()
-        col_settings.prop(settings, "sample_size")
-        col_settings.prop(settings, "chroma_only")
-        col_settings.prop(settings, "debug_parity_logging")
-
-        layout.separator()
-        layout.label(text="3. Calculate & Apply:")
-        box_calc = layout.box()
-        col_calc = box_calc.column()
-        col_calc.operator(MB_OT_CalculateMatrix.bl_idname, text="Calculate Matrix", icon='RENDER_ANIMATION')
-        col_calc.separator()
-        col_calc.label(text="Apply to Compositor Node:")
-        col_calc.prop(settings, "create_exposure_node")
-        norm_row = col_calc.row(align=True)
-        norm_row.enabled = False
-        norm_row.prop(settings, "normalization_factor", text="Norm Factor")
-        row_apply = col_calc.row(align=True)
-        row_apply.prop(settings, "node_name", text="")
-        apply_op_layout = row_apply.row(align=True)
-        apply_op_layout.active = getattr(context.scene, 'use_nodes', False)
-        apply_op_layout.operator(MB_OT_ApplyToCompositor.bl_idname, text="Apply", icon='FORWARD')
-
-        col_calc.separator()
-        if settings.calculation_done:
-            col_calc.label(text="Calculated Matrix:")
-        else:
-            col_calc.label(text="Matrix (Current/Not Calculated):")
-        box_matrix_display = col_calc.box()
-        col_matrix_lines = box_matrix_display.column(align=True)
-        
-        matrix_lines = settings.matrix_display_string.split('\n')
-        for line in matrix_lines:
-            row_mat_line = col_matrix_lines.row()
-            row_mat_line.label(text=line)
-        
-        export_op_layout = col_matrix_lines.row(align=True)
-        export_op_layout.active = settings.calculation_done
-        export_op_layout.operator(MB_OT_ExportLUT.bl_idname, text="Export .cube LUT", icon='EXPORT')
-
-# --- Registration ---
 classes = (
     MacbethCalibratorPreferences,
     MacbethCalibratorSettings,
-    MB_OT_SetupSampleMarkers,
-    MB_OT_SetBackground,
-    MB_OT_CalculateMatrix,
-    MB_OT_ApplyToCompositor,
-    MB_OT_ExportLUT,
-    MB_PT_CalibratorPanel,
+    sampling.MB_ColorSample,
+    sampling.MB_ImageSampleData,
+    sampling.MB_GT_OverlaySquare,
+    sampling.MB_GT_CornerCross,
+    sampling.MB_GGT_ImageEditorOverlay,
+    sampling.MB_OT_AdjustOverlayCorner,
+    sampling.MB_OT_SaveSampleData,
+    sampling.MB_OT_SampleImageColors,
+    sampling.MB_OT_ClearSampleData,
+    sampling.MB_PT_ImageEditorSamplePanel,
+    calibration.MB_OT_CreateTransform,
+    calibration.MB_PT_CalibrationPanel,
 )
 
+
 def register():
-    """Registers all addon classes and adds properties."""
     for cls in classes:
         bpy.utils.register_class(cls)
-    
+
     bpy.types.Scene.macbeth_calibrator_settings = PointerProperty(type=MacbethCalibratorSettings)
-    
-    # Add the handler to Blender's application handlers
-    if macbeth_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(macbeth_depsgraph_handler)
+    bpy.types.Image.macbeth_sample_data = PointerProperty(type=sampling.MB_ImageSampleData)
+    bpy.types.Image.mb_sample_data = PointerProperty(type=sampling.MB_ImageSampleData)
+    sampling.MB_Messagebus_Init()
+    sampling.MB_ImageEditor_Changed()
+
+    if sampling.MB_Messagebus_LoadPost not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(sampling.MB_Messagebus_LoadPost)
+
 
 def unregister():
-    """Unregisters all addon classes and removes properties."""
-    # Remove the handler safely
-    if macbeth_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(macbeth_depsgraph_handler)
-            
+    sampling.MB_Messagebus_Remove()
+
+    if sampling.MB_Messagebus_LoadPost in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(sampling.MB_Messagebus_LoadPost)
+
     try:
         del bpy.types.Scene.macbeth_calibrator_settings
     except (AttributeError, RuntimeError):
         pass
 
+    for prop_name in ('macbeth_sample_data', 'mb_sample_data'):
+        try:
+            delattr(bpy.types.Image, prop_name)
+        except (AttributeError, RuntimeError):
+            pass
+
     for cls in reversed(classes):
         try:
             bpy.utils.unregister_class(cls)
-        except (RuntimeError):
+        except RuntimeError:
             pass

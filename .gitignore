@@ -188,6 +188,7 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file. However, if you prefer, 
 #  you could uncomment the following to ignore the entire vscode folder
 # .vscode/
+blender_vscode_development/
 
 # Ruff stuff:
 .ruff_cache/
@@ -197,6 +198,10 @@ cython_debug/
 
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
+
+# Local editor/project folders
+.idea/
+.vscode/
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
