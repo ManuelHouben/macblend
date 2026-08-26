@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # <pep8 compliant>
-
-import json
-import os
+# Acknowledgements: This add-on owes much to Marco Meyer's mmColorTarget and
+# Jed Smith's (jedypod) CalibrateMacbeth for Nuke, with inspiration from
+# Paul Schlichter's Colour Chart Camera Matcher add-on.
 
 import bpy
 from bpy.props import (
@@ -15,47 +15,12 @@ from bpy.props import (
 )
 
 from . import calibration
+from . import colorspaces
 from . import sampling
 
 
 _enum_cache = None
-_enum_cache_path = None
-
-
-def clamp_sample_region(image_size, center_x, center_y, patch_size):
-    """Return a bounded sample rect that stays inside the image pixel bounds.
-
-    The old image-sampling logic in the CCC variant sampled an unbounded box around
-    the patch center. If the overlay was slightly misaligned or the sample center was
-    near an edge, the resulting slice could expand beyond the image bounds and trigger
-    an expensive full-frame average, which locks Blender. Clamping the rect to the
-    image bounds keeps the operation bounded and predictable.
-    """
-    width, height = image_size
-    if width <= 0 or height <= 0:
-        return None
-
-    sample_size = max(1, int(patch_size))
-    if sample_size > max(width, height):
-        sample_size = max(width, height)
-
-    half = sample_size // 2
-    x = int(round(center_x))
-    y = int(round(center_y))
-
-    x0 = max(0, x - half)
-    x1 = min(width, x + half + (sample_size % 2))
-    y0 = max(0, y - half)
-    y1 = min(height, y + half + (sample_size % 2))
-
-    if x0 >= x1:
-        x = max(0, min(width - 1, x))
-        return (x, x + 1, y, y + 1)
-    if y0 >= y1:
-        y = max(0, min(height - 1, y))
-        return (x0, x1, y, y + 1)
-
-    return (x0, x1, y0, y1)
+_enum_cache_key = None
 
 
 def get_image_colorspace_name(image):
@@ -91,7 +56,7 @@ def get_image_sampling_guidance(image):
 
 
 def get_target_colorspace_items(self, context):
-    global _enum_cache, _enum_cache_path
+    global _enum_cache, _enum_cache_key
     items = [("LINEAR_SRGB_D65", "Linear sRGB D65 (Internal)", "Use the internal Linear sRGB D65 reference values")]
 
     if context is None:
@@ -108,16 +73,16 @@ def get_target_colorspace_items(self, context):
                 else:
                     json_path = getattr(addon_prefs, 'json_file_path', None)
 
-        if _enum_cache and _enum_cache_path == json_path:
+        cache_key = colorspaces.json_cache_key(json_path)
+        if _enum_cache and _enum_cache_key == cache_key:
             return _enum_cache
 
-        if not json_path or not os.path.exists(json_path):
+        if not json_path:
             _enum_cache = items
-            _enum_cache_path = json_path
+            _enum_cache_key = None
             return items
 
-        with open(json_path, 'r') as f:
-            json_data = json.load(f)
+        json_data = colorspaces.load_colorspace_data(json_path)
 
         if "XYZ_to_RGB_matrices" in json_data:
             sorted_keys = sorted(json_data["XYZ_to_RGB_matrices"].keys())
@@ -125,9 +90,10 @@ def get_target_colorspace_items(self, context):
                 items.append((key, key, f"Target {key} colorspace from JSON"))
 
         _enum_cache = items
-        _enum_cache_path = json_path
+        _enum_cache_key = cache_key
         return items
-    except Exception:
+    except (OSError, colorspaces.ColorspaceDataError) as exc:
+        print(f"[MacBlend] {exc}")
         return items
 
 
@@ -147,15 +113,7 @@ class MacBlendCalibratorPreferences(bpy.types.AddonPreferences):
     )
 
     def get_effective_json_path(self):
-        user_path = self.json_file_path
-        if user_path and os.path.exists(user_path):
-            return user_path
-
-        addon_dir = os.path.dirname(os.path.abspath(__file__))
-        bundled_path = os.path.join(addon_dir, "mmColorTarget_colorspace_transforms.json")
-        if os.path.exists(bundled_path):
-            return bundled_path
-        return None
+        return colorspaces.effective_json_path(self.json_file_path)
 
     def draw(self, context):
         layout = self.layout
@@ -167,7 +125,11 @@ class MacBlendCalibratorPreferences(bpy.types.AddonPreferences):
         effective_path = self.get_effective_json_path()
         if effective_path:
             box = layout.box()
-            box.label(text=f"Effective Path: {effective_path}", icon='INFO')
+            try:
+                colorspaces.load_colorspace_data(effective_path)
+                box.label(text=f"Effective Path: {effective_path}", icon='INFO')
+            except colorspaces.ColorspaceDataError as exc:
+                box.label(text=str(exc), icon='ERROR')
         else:
             box = layout.box()
             box.label(text="Warning: No valid JSON file found.", icon='ERROR')
@@ -176,21 +138,15 @@ class MacBlendCalibratorPreferences(bpy.types.AddonPreferences):
 class MacBlendCalibratorSettings(bpy.types.PropertyGroup):
     sample_source_image: PointerProperty(
         name="Source Image",
-        description="Saved Macbeth chart calibration data to use when creating the transform",
+        description="Macbeth chart calibration data to use when creating the transform",
         type=bpy.types.Image,
-        poll=lambda self, obj: obj is not None and (
-            (getattr(obj, 'macblend_sample_data', None) is not None and obj.macblend_sample_data.is_saved) or
-            (getattr(obj, 'mb_sample_data', None) is not None and obj.mb_sample_data.is_saved)
-        ),
+        poll=lambda self, obj: sampling.image_has_sample_values(obj),
     )
     sample_target_image: PointerProperty(
         name="Target Image",
-        description="Saved Macbeth chart calibration data to use as the target values",
+        description="Macbeth chart calibration data to use as the target values",
         type=bpy.types.Image,
-        poll=lambda self, obj: obj is not None and (
-            (getattr(obj, 'macblend_sample_data', None) is not None and obj.macblend_sample_data.is_saved) or
-            (getattr(obj, 'mb_sample_data', None) is not None and obj.mb_sample_data.is_saved)
-        ),
+        poll=lambda self, obj: sampling.image_has_sample_values(obj),
     )
     use_reference_target: BoolProperty(
         name="Use reference values as target",
@@ -198,8 +154,8 @@ class MacBlendCalibratorSettings(bpy.types.PropertyGroup):
         default=True,
     )
     normalize_calibration: BoolProperty(
-        name="Normalize to Mid Grey",
-        description="Match the Nuke behavior by pre-scaling source samples to the neutral patch before solving the calibration matrix.",
+        name="Normalize",
+        description="Pre-scaling source samples to the mid-grey patch before solving the calibration matrix.",
         default=True,
     )
     create_exposure_node: BoolProperty(
@@ -248,6 +204,8 @@ classes = (
     sampling.MB_ColorSample,
     sampling.MB_ChartPatchCenter,
     sampling.MB_ImageSampleData,
+    sampling.MB_SamplingUIState,
+    sampling.MB_UL_SampledImages,
     sampling.MB_GT_OverlaySquare,
     sampling.MB_GT_CornerCross,
     sampling.MB_GT_FlipArrow,
@@ -256,13 +214,11 @@ classes = (
     sampling.MB_OT_FlipOverlayHorizontal,
     sampling.MB_OT_FlipOverlayVertical,
     sampling.MB_OT_CenterOverlayChart,
-    sampling.MB_OT_SaveSampleData,
     sampling.MB_OT_SampleImageColors,
     sampling.MB_OT_ClearSampleData,
     sampling.MB_PT_ImageEditorSamplePanel,
     calibration.MB_OT_MatchTransform,
     calibration.MB_OT_NeutralizeTransform,
-    calibration.MB_OT_CreateTransform,
     calibration.MB_PT_CalibrationPanel,
 )
 
@@ -272,9 +228,7 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.macblend_calibrator_settings = PointerProperty(type=MacBlendCalibratorSettings)
-    bpy.types.Scene.macbeth_calibrator_settings = PointerProperty(type=MacBlendCalibratorSettings)
-    bpy.types.Image.macblend_sample_data = PointerProperty(type=sampling.MB_ImageSampleData)
-    bpy.types.Image.macbeth_sample_data = PointerProperty(type=sampling.MB_ImageSampleData)
+    bpy.types.Scene.macblend_sampling_ui = PointerProperty(type=sampling.MB_SamplingUIState)
     bpy.types.Image.mb_sample_data = PointerProperty(type=sampling.MB_ImageSampleData)
     sampling.MB_Messagebus_Init()
     sampling.MB_ImageEditor_Changed()
@@ -295,15 +249,14 @@ def unregister():
         pass
 
     try:
-        del bpy.types.Scene.macbeth_calibrator_settings
+        del bpy.types.Scene.macblend_sampling_ui
     except (AttributeError, RuntimeError):
         pass
 
-    for prop_name in ('macblend_sample_data', 'macbeth_sample_data', 'mb_sample_data'):
-        try:
-            delattr(bpy.types.Image, prop_name)
-        except (AttributeError, RuntimeError):
-            pass
+    try:
+        del bpy.types.Image.mb_sample_data
+    except (AttributeError, RuntimeError):
+        pass
 
     for cls in reversed(classes):
         try:
