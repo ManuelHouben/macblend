@@ -177,9 +177,14 @@ class MacBlendCalibratorSettings(bpy.types.PropertyGroup):
             (getattr(obj, 'mb_sample_data', None) is not None and obj.mb_sample_data.is_saved)
         ),
     )
+    normalize_calibration: BoolProperty(
+        name="Normalize to Mid Grey",
+        description="Match the Nuke behavior by pre-scaling source samples to the neutral patch before solving the calibration matrix.",
+        default=True,
+    )
     create_exposure_node: BoolProperty(
         name="Create Exposure Node",
-        description="Normalize the matrix and insert a matching exposure/scale node when checked; leave the raw matrix when unchecked.",
+        description="Insert a matching exposure/scale node after the calculated matrix. This is optional and independent from the normalization solve itself.",
         default=True,
     )
     normalization_factor: FloatProperty(
@@ -191,7 +196,7 @@ class MacBlendCalibratorSettings(bpy.types.PropertyGroup):
     debug_parity_logging: BoolProperty(
         name="Debug Parity Logging",
         description="Print sampled input patches and additional parity diagnostics to the console for comparison.",
-        default=False,
+        default=True,
     )
     target_colorspace: EnumProperty(
         name="Target Colorspace",
@@ -226,6 +231,7 @@ classes = (
     MacBlendCalibratorPreferences,
     MacBlendCalibratorSettings,
     sampling.MB_ColorSample,
+    sampling.MB_ChartPatchCenter,
     sampling.MB_ImageSampleData,
     sampling.MB_GT_OverlaySquare,
     sampling.MB_GT_CornerCross,
