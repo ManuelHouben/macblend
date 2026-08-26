@@ -219,6 +219,8 @@ classes = (
     sampling.MB_PT_ImageEditorSamplePanel,
     calibration.MB_OT_MatchTransform,
     calibration.MB_OT_NeutralizeTransform,
+    calibration.MB_OT_ExportLuts,
+    calibration.MB_OT_ConfirmLutOverwrite,
     calibration.MB_PT_CalibrationPanel,
 )
 
