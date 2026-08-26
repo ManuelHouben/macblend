@@ -59,7 +59,7 @@ def sample_image_color(pixel_buffer, width, height, px, py, sample_size):
         print(f"Error sampling region at ({px},{py}): {e}")
         return fallback_color
 
-def calculate_matrix(input_samples, ref_samples):
+def calculate_matrix(input_samples, ref_samples, *, debug=False):
     """Calculates the 3x3 calibration matrix using numpy least squares."""
     if not isinstance(input_samples, np.ndarray) or input_samples.shape != (24, 3):
         print(f"      Err: Invalid input samples. Shape: {input_samples.shape if isinstance(input_samples, np.ndarray) else type(input_samples)}")
@@ -81,10 +81,11 @@ def calculate_matrix(input_samples, ref_samples):
         # transpose the result before flattening / storing it.
         result_x, residuals, rank, s = np.linalg.lstsq(input_samples, ref_samples, rcond=-1)
         matrix_calculated = result_x
-        print(f"        lstsq rank: {rank}, residuals: {residuals}")
-        print("        Raw lstsq matrix:")
-        for row in matrix_calculated:
-            print(f"          [{row[0]:>9.6f} {row[1]:>9.6f} {row[2]:>9.6f}]")
+        if debug:
+            print(f"        lstsq rank: {rank}, residuals: {residuals}")
+            print("        Raw lstsq matrix:")
+            for row in matrix_calculated:
+                print(f"          [{row[0]:>9.6f} {row[1]:>9.6f} {row[2]:>9.6f}]")
     except np.linalg.LinAlgError as e:
         print(f"      LinAlgError during least squares calculation: {e}")
         return None
@@ -95,7 +96,8 @@ def calculate_matrix(input_samples, ref_samples):
         print(f"      Err: Resulting matrix shape is incorrect: {matrix_calculated.shape}")
         return None
     matrix_final = matrix_calculated.T
-    print("        Nuke-style transposed matrix:")
-    for row in matrix_final:
-        print(f"          [{row[0]:>9.6f} {row[1]:>9.6f} {row[2]:>9.6f}]")
+    if debug:
+        print("        Nuke-style transposed matrix:")
+        for row in matrix_final:
+            print(f"          [{row[0]:>9.6f} {row[1]:>9.6f} {row[2]:>9.6f}]")
     return matrix_final.tolist()

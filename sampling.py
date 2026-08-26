@@ -52,6 +52,11 @@ MB_MACBETH_REFERENCE_SRGB = (
     (49 / 255.0, 49 / 255.0, 51 / 255.0),
 )
 
+
+def _debug_logging_enabled(context):
+    addon = context.preferences.addons.get(__package__)
+    return bool(addon and getattr(addon.preferences, 'debug_logging', False))
+
 # Logical Macbeth order is top-to-bottom, left-to-right, matching the chart layout
 # used by the color-reference arrays and by the Nuke tools.
 # ccmaster: canonical Macbeth patch ordering used as the ground truth for all chart logic.
@@ -765,10 +770,13 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
 
         pixels = np.asarray(image.pixels, dtype=np.float32).reshape((height, width, image.channels))
         overlay_corners = _get_overlay_corners(data, image)
-        print(f"[MacBlend] User overlay state: h={bool(data.chart_hflip)} v={bool(data.chart_vflip)}", flush=True)
+        debug_logging = _debug_logging_enabled(context)
+        if debug_logging:
+            print(f"[MacBlend] User overlay state: h={bool(data.chart_hflip)} v={bool(data.chart_vflip)}", flush=True)
         _build_ccmaster_patch_centers(data, overlay_corners)
         sample_size = max(1, min(int(data.patch_size), max(width, height)))
-        print("[MacBlend] Sample Chart debug:", flush=True)
+        if debug_logging:
+            print("[MacBlend] Sample Chart debug:", flush=True)
 
         for patch in data.patch_centers:
             slot = int(patch.slot)
@@ -781,7 +789,8 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
             sample.patch_index = slot
             sample.rgb = sample_rgb
             _set_sample_patch_value(data, slot, sample.rgb)
-            print(f"  slot[{slot}] {patch_name} -> {tuple(float(v) for v in sample_rgb)}", flush=True)
+            if debug_logging:
+                print(f"  slot[{slot}] {patch_name} -> {tuple(float(v) for v in sample_rgb)}", flush=True)
 
         data.has_preview = True
         data.is_saved = False

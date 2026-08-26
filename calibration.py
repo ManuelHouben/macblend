@@ -7,6 +7,11 @@ import numpy as np
 from . import core, sampling
 
 
+def _debug_logging_enabled(context):
+    addon = context.preferences.addons.get(__package__)
+    return bool(addon and getattr(addon.preferences, 'debug_logging', False))
+
+
 def _get_editor_kind(space_data):
     if space_data is None:
         return None
@@ -59,89 +64,45 @@ def _group_is_usable(group):
         if socket is None or getattr(socket, 'type', None) != 'VECTOR':
             return False
 
+    separate_xyz_types = {'CompositorNodeSeparateXYZ', 'CompositorNodeSepXYZ', 'ShaderNodeSeparateXYZ'}
+    combine_xyz_types = {'CompositorNodeCombineXYZ', 'CompositorNodeCombXYZ', 'ShaderNodeCombineXYZ'}
+    separate_xyz_count = sum(node.bl_idname in separate_xyz_types for node in group.nodes)
+    if separate_xyz_count < 4 or not any(node.bl_idname in combine_xyz_types for node in group.nodes):
+        return False
+
     return True
 
 
-def _new_color_separate_node(group, tree_type):
-    if tree_type == 'SHADER':
-        for node_type in ('ShaderNodeSeparateColor', 'ShaderNodeSeparateRGB'):
-            try:
-                node = group.nodes.new(type=node_type)
-                if hasattr(node, 'mode'):
-                    node.mode = 'RGB'
-                return node
-            except RuntimeError:
-                continue
-        raise RuntimeError("Could not create a compatible shader color-separate node.")
-
-    for node_type in ('CompositorNodeSeparateColor', 'CompositorNodeSepRGBA'):
-        try:
-            node = group.nodes.new(type=node_type)
-            if hasattr(node, 'mode'):
-                node.mode = 'RGB'
-            return node
-        except RuntimeError:
-            continue
-
-    raise RuntimeError("Could not create a compatible compositor color-separate node.")
-
-
-def _new_color_combine_node(group, tree_type):
-    if tree_type == 'SHADER':
-        for node_type in ('ShaderNodeCombineColor', 'ShaderNodeCombineRGB'):
-            try:
-                node = group.nodes.new(type=node_type)
-                if hasattr(node, 'mode'):
-                    node.mode = 'RGB'
-                return node
-            except RuntimeError:
-                continue
-        raise RuntimeError("Could not create a compatible shader color-combine node.")
-
-    for node_type in ('CompositorNodeCombineColor', 'CompositorNodeCombRGBA'):
-        try:
-            node = group.nodes.new(type=node_type)
-            if hasattr(node, 'mode'):
-                node.mode = 'RGB'
-            return node
-        except RuntimeError:
-            continue
-
-    raise RuntimeError("Could not create a compatible compositor color-combine node.")
-
-
-def _new_vector_separate_node(group, tree_type):
-    if tree_type == 'SHADER':
-        for node_type in ('ShaderNodeSeparateXYZ', 'ShaderNodeSeparateColor', 'ShaderNodeSeparateRGB'):
-            try:
-                node = group.nodes.new(type=node_type)
-                if hasattr(node, 'mode'):
-                    node.mode = 'RGB'
-                return node
-            except RuntimeError:
-                continue
-        raise RuntimeError("Could not create a compatible shader vector-separate node.")
-
-    # Compositor support varies by Blender version. Prefer explicit XYZ split nodes,
-    # then gracefully fall back to color split nodes (vector links are auto-converted).
-    for node_type in (
+def _new_xyz_separate_node(group, tree_type):
+    node_types = ('ShaderNodeSeparateXYZ',) if tree_type == 'SHADER' else (
         'CompositorNodeSeparateXYZ',
         'CompositorNodeSepXYZ',
         'ShaderNodeSeparateXYZ',
-        'CompositorNodeSeparateColor',
-        'CompositorNodeSepRGBA',
-        'ShaderNodeSeparateColor',
-        'ShaderNodeSeparateRGB',
-    ):
+    )
+    for node_type in node_types:
         try:
             node = group.nodes.new(type=node_type)
-            if hasattr(node, 'mode'):
-                node.mode = 'RGB'
             return node
         except RuntimeError:
             continue
 
-    raise RuntimeError("Could not create a compatible compositor vector-separate node.")
+    raise RuntimeError(f"Could not create a compatible {tree_type.lower()} Separate XYZ node.")
+
+
+def _new_xyz_combine_node(group, tree_type):
+    node_types = ('ShaderNodeCombineXYZ',) if tree_type == 'SHADER' else (
+        'CompositorNodeCombineXYZ',
+        'CompositorNodeCombXYZ',
+        'ShaderNodeCombineXYZ',
+    )
+    for node_type in node_types:
+        try:
+            node = group.nodes.new(type=node_type)
+            return node
+        except RuntimeError:
+            continue
+
+    raise RuntimeError(f"Could not create a compatible {tree_type.lower()} Combine XYZ node.")
 
 
 def _new_math_node(group, tree_type, operation):
@@ -269,11 +230,11 @@ def build_matrix_node_group(tree_type):
 
     in_node = group.nodes.new(type='NodeGroupInput')
     out_node = group.nodes.new(type='NodeGroupOutput')
-    sep_img = _new_color_separate_node(group, tree_type)
-    sep_m_r = _new_vector_separate_node(group, tree_type)
-    sep_m_g = _new_vector_separate_node(group, tree_type)
-    sep_m_b = _new_vector_separate_node(group, tree_type)
-    combine = _new_color_combine_node(group, tree_type)
+    sep_img = _new_xyz_separate_node(group, tree_type)
+    sep_m_r = _new_xyz_separate_node(group, tree_type)
+    sep_m_g = _new_xyz_separate_node(group, tree_type)
+    sep_m_b = _new_xyz_separate_node(group, tree_type)
+    combine = _new_xyz_combine_node(group, tree_type)
 
     group.links.new(in_node.outputs['Image'], sep_img.inputs[0])
     group.links.new(in_node.outputs['Output Red'], sep_m_r.inputs[0])
@@ -387,8 +348,9 @@ def _prepare_calibration_data(self, context):
         "Blue", "Green", "Red", "Yellow", "Magenta", "Cyan",
         "White 9.5", "Neutral 8", "Neutral 6.5", "Neutral 5", "Neutral 3.5", "Black 2",
     )
+    debug_logging = _debug_logging_enabled(context)
 
-    if settings.debug_parity_logging:
+    if debug_logging:
         print("[MacBlend] Source samples in Macbeth slot order:", flush=True)
         for idx, value in enumerate(source_samples):
             patch_name = standard_patch_names[idx] if idx < len(standard_patch_names) else f"slot_{idx}"
@@ -417,24 +379,24 @@ def _prepare_calibration_data(self, context):
         src_luma = float(np.dot(src_grey, core.LUMA_COEFFS_REC709))
         ref_luma = float(np.dot(ref_grey, core.LUMA_COEFFS_REC709))
 
-        if settings.debug_parity_logging:
+        if debug_logging:
             print(f"[MacBlend] Neutral patch idx={neutral_idx} src_grey={tuple(float(v) for v in src_grey)} src_luma={src_luma}", flush=True)
             print(f"[MacBlend] Neutral patch idx={neutral_idx} ref_grey={tuple(float(v) for v in ref_grey)} ref_luma={ref_luma}", flush=True)
 
         if src_luma > 1e-7:
             normalization_factor = ref_luma / src_luma
             matrix_input = source_samples * normalization_factor
-            if settings.debug_parity_logging:
+            if debug_logging:
                 print(f"[MacBlend] Normalization factor = {normalization_factor}", flush=True)
         else:
             normalization_factor = 1.0
 
-    if settings.debug_parity_logging:
+    if debug_logging:
         print("[MacBlend] Matrix input samples after normalization:", flush=True)
         for idx, value in enumerate(matrix_input):
             print(f"  matrix_input[{idx}] = {tuple(float(v) for v in value)}", flush=True)
 
-    matrix_3x3 = core.calculate_matrix(matrix_input, ref)
+    matrix_3x3 = core.calculate_matrix(matrix_input, ref, debug=debug_logging)
     if matrix_3x3 is None:
         self.report({'ERROR'}, "Matrix calculation failed.")
         return None, None, None, None, None
@@ -572,8 +534,8 @@ class MB_OT_CreateTransform(bpy.types.Operator):
 class MB_PT_CalibrationPanel(bpy.types.Panel):
     bl_space_type = 'NODE_EDITOR'
     bl_region_type = 'UI'
-    bl_label = 'Macbeth Calibration'
-    bl_category = 'Macbeth'
+    bl_label = 'MacBlend'
+    bl_category = 'MacBlend'
 
     @classmethod
     def poll(cls, context):
@@ -587,7 +549,6 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
         layout.prop(settings, 'sample_source_image', text='Image')
         layout.prop(settings, 'target_colorspace', text='Target')
         layout.prop(settings, 'normalize_calibration', text='Normalize to Mid Grey')
-        layout.prop(settings, 'debug_parity_logging', text='Debug Parity Logging')
         layout.prop(settings, 'create_exposure_node', text='Create Exposure Node')
         layout.prop(settings, 'node_name', text='Node Name')
         row = layout.row(align=True)

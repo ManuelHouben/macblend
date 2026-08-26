@@ -140,6 +140,11 @@ class MacBlendCalibratorPreferences(bpy.types.AddonPreferences):
         subtype='FILE_PATH',
         default="",
     )
+    debug_logging: BoolProperty(
+        name="Debug Logging",
+        description="Print sampling and calibration diagnostics to the console",
+        default=False,
+    )
 
     def get_effective_json_path(self):
         user_path = self.json_file_path
@@ -157,6 +162,7 @@ class MacBlendCalibratorPreferences(bpy.types.AddonPreferences):
         layout.label(text="Specify the path to the colorspace transforms JSON file.")
         layout.label(text="If left blank, a bundled default file will be used.")
         layout.prop(self, "json_file_path")
+        layout.prop(self, "debug_logging")
 
         effective_path = self.get_effective_json_path()
         if effective_path:
@@ -192,11 +198,6 @@ class MacBlendCalibratorSettings(bpy.types.PropertyGroup):
         description="Stored luminance compensation factor from the last matrix calculation",
         default=1.0,
         min=0.0,
-    )
-    debug_parity_logging: BoolProperty(
-        name="Debug Parity Logging",
-        description="Print sampled input patches and additional parity diagnostics to the console for comparison.",
-        default=True,
     )
     target_colorspace: EnumProperty(
         name="Target Colorspace",
