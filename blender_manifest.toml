@@ -1,6 +1,7 @@
 # See https://docs.blender.org/api/main/extensions.html
 schema_version = "1.0.0"
 id = "macblend"
+<<<<<<< Updated upstream
 name = "Macbeth Calibrator"
 tagline = "Create a Macbeth color calibration matrix from image samples"
 type = "add-on"
@@ -13,3 +14,17 @@ license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
 files = "Read embedded colorspace transform data"
+=======
+name = "MacBlend"
+tagline = "Calibrate colors in your scene using a Macbeth chart"
+type = "add-on"
+maintainer = "Manuel Houben"
+version = "1.0.0"
+blender_version_min = "4.2.0"
+description = "Calculates a color matrix using a Macbeth chart."
+tags = ["Color", "Calibration", "Compositor", "Image Editor"]
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read bundled color-transform data and user-selected JSON files"
+>>>>>>> Stashed changes
