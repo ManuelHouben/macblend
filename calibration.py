@@ -205,6 +205,31 @@ def _build_reference_samples(context, selected_target):
         raise ValueError(f"Failed to build target reference '{selected_target}': {exc}") from exc
 
 
+def _ordered_image_samples(image):
+    if image is None:
+        return None
+
+    data = getattr(image, 'mb_sample_data', None)
+    if data is None or not data.is_saved or len(data.samples) == 0:
+        return None
+
+    ordered_samples = [None] * 24
+    for sample in data.samples:
+        patch_index = int(getattr(sample, 'patch_index', -1))
+        if 0 <= patch_index < 24:
+            ordered_samples[patch_index] = tuple(float(channel) for channel in sample.rgb)
+
+    samples = np.array([value for value in ordered_samples if value is not None], dtype=np.float32)
+    return samples if samples.shape == (24, 3) else None
+
+
+def _target_is_selected(context):
+    settings = getattr(context.scene, 'macblend_calibrator_settings', None)
+    if settings is None:
+        settings = getattr(context.scene, 'macbeth_calibrator_settings', None)
+    return bool(settings and (settings.use_reference_target or settings.sample_target_image is not None))
+
+
 def build_matrix_node_group(tree_type):
     group_name = "MB ColorMatrix (Shader)" if tree_type == 'SHADER' else "MB ColorMatrix (Compositor)"
     group = bpy.data.node_groups.get(group_name)
@@ -307,11 +332,6 @@ def _prepare_calibration_data(self, context):
         self.report({'ERROR'}, "No valid saved source image selected.")
         return None, None, None, None, None
 
-    data = image.mb_sample_data
-    if not data.is_saved or len(data.samples) == 0:
-        self.report({'ERROR'}, "The selected image has no saved Macbeth data.")
-        return None, None, None, None, None
-
     editor_kind = _get_editor_kind(getattr(context, 'space_data', None))
     if editor_kind is None:
         self.report({'ERROR'}, "This operator only works in Shader or Compositor Node Editor.")
@@ -322,25 +342,29 @@ def _prepare_calibration_data(self, context):
         self.report({'ERROR'}, "This panel only works in the Shader or Compositor editor.")
         return None, None, None, None, None
 
-    ordered_samples = [None] * 24
-    for sample in data.samples:
-        if not hasattr(sample, 'patch_index'):
-            continue
-        patch_index = int(getattr(sample, 'patch_index', -1))
-        if 0 <= patch_index < 24:
-            ordered_samples[patch_index] = tuple(float(channel) for channel in sample.rgb)
-
-    source_samples = np.array([value for value in ordered_samples if value is not None], dtype=np.float32)
-    if source_samples.shape != (24, 3):
+    source_samples = _ordered_image_samples(image)
+    if source_samples is None:
         self.report({'ERROR'}, "The image samples do not form a complete 24-patch Macbeth set.")
         return None, None, None, None, None
 
-    selected_target = settings.target_colorspace or "LINEAR_SRGB_D65"
-    try:
-        ref = _build_reference_samples(context, selected_target)
-    except ValueError as exc:
-        self.report({'ERROR'}, str(exc))
-        return None, None, None, None, None
+    if settings.use_reference_target:
+        selected_target = settings.target_colorspace or "LINEAR_SRGB_D65"
+        try:
+            target_samples = _build_reference_samples(context, selected_target)
+        except ValueError as exc:
+            self.report({'ERROR'}, str(exc))
+            return None, None, None, None, None
+        target_description = f"reference '{selected_target}'"
+    else:
+        target_image = settings.sample_target_image
+        if target_image is None:
+            self.report({'ERROR'}, "No saved target image selected.")
+            return None, None, None, None, None
+        target_samples = _ordered_image_samples(target_image)
+        if target_samples is None:
+            self.report({'ERROR'}, "The target image samples do not form a complete 24-patch Macbeth set.")
+            return None, None, None, None, None
+        target_description = f"image '{target_image.name}'"
 
     standard_patch_names = (
         "Dark Skin", "Light Skin", "Blue Sky", "Foliage", "Blue Flower", "Bluish Green",
@@ -355,12 +379,12 @@ def _prepare_calibration_data(self, context):
         for idx, value in enumerate(source_samples):
             patch_name = standard_patch_names[idx] if idx < len(standard_patch_names) else f"slot_{idx}"
             print(f"  slot[{idx}] ({patch_name}) = {tuple(float(v) for v in value)}", flush=True)
-        print("[MacBlend] Reference samples (standard Macbeth order):", flush=True)
-        for idx, value in enumerate(ref):
-            print(f"  ref[{idx}] ({standard_patch_names[idx]}) = {tuple(float(v) for v in value)}", flush=True)
+        print(f"[MacBlend] Target samples from {target_description} (standard Macbeth order):", flush=True)
+        for idx, value in enumerate(target_samples):
+            print(f"  target[{idx}] ({standard_patch_names[idx]}) = {tuple(float(v) for v in value)}", flush=True)
 
         print("[MacBlend] Raw scan-order samples with assigned patch slots:", flush=True)
-        for sample in data.samples:
+        for sample in image.mb_sample_data.samples:
             patch_index = int(getattr(sample, 'patch_index', -1))
             if 0 <= patch_index < 24:
                 print(f"  scan[{sample.name if hasattr(sample, 'name') else patch_index}] -> slot[{patch_index}] ({standard_patch_names[patch_index]}) = {tuple(float(v) for v in sample.rgb)}", flush=True)
@@ -370,12 +394,12 @@ def _prepare_calibration_data(self, context):
 
     if settings.normalize_calibration:
         neutral_idx = 21
-        if neutral_idx >= len(source_samples) or neutral_idx >= len(ref):
+        if neutral_idx >= len(source_samples) or neutral_idx >= len(target_samples):
             self.report({'ERROR'}, "Neutral patch index is out of bounds for normalization.")
             return None, None, None, None, None
 
         src_grey = source_samples[neutral_idx]
-        ref_grey = ref[neutral_idx]
+        ref_grey = target_samples[neutral_idx]
         src_luma = float(np.dot(src_grey, core.LUMA_COEFFS_REC709))
         ref_luma = float(np.dot(ref_grey, core.LUMA_COEFFS_REC709))
 
@@ -396,7 +420,7 @@ def _prepare_calibration_data(self, context):
         for idx, value in enumerate(matrix_input):
             print(f"  matrix_input[{idx}] = {tuple(float(v) for v in value)}", flush=True)
 
-    matrix_3x3 = core.calculate_matrix(matrix_input, ref, debug=debug_logging)
+    matrix_3x3 = core.calculate_matrix(matrix_input, target_samples, debug=debug_logging)
     if matrix_3x3 is None:
         self.report({'ERROR'}, "Matrix calculation failed.")
         return None, None, None, None, None
@@ -481,6 +505,10 @@ class MB_OT_MatchTransform(bpy.types.Operator):
     bl_label = "Match"
     bl_options = {'REGISTER', 'UNDO'}
 
+    @classmethod
+    def poll(cls, context):
+        return _target_is_selected(context)
+
     def execute(self, context):
         settings, editor_kind, tree, matrix_3x3, normalization_factor = _prepare_calibration_data(self, context)
         if settings is None:
@@ -506,6 +534,10 @@ class MB_OT_NeutralizeTransform(bpy.types.Operator):
     bl_idname = "macblend.neutralize_transform"
     bl_label = "Neutralize"
     bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _target_is_selected(context)
 
     def execute(self, context):
         settings, editor_kind, tree, matrix_3x3, normalization_factor = _prepare_calibration_data(self, context)
@@ -547,7 +579,11 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
         if settings is None:
             settings = getattr(context.scene, 'macbeth_calibrator_settings', None)
         layout.prop(settings, 'sample_source_image', text='Image')
-        layout.prop(settings, 'target_colorspace', text='Target')
+        layout.prop(settings, 'use_reference_target')
+        if settings.use_reference_target:
+            layout.prop(settings, 'target_colorspace', text='Target')
+        else:
+            layout.prop(settings, 'sample_target_image', text='Target')
         layout.prop(settings, 'normalize_calibration', text='Normalize to Mid Grey')
         layout.prop(settings, 'create_exposure_node', text='Create Exposure Node')
         layout.prop(settings, 'node_name', text='Node Name')

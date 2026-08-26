@@ -183,6 +183,20 @@ class MacBlendCalibratorSettings(bpy.types.PropertyGroup):
             (getattr(obj, 'mb_sample_data', None) is not None and obj.mb_sample_data.is_saved)
         ),
     )
+    sample_target_image: PointerProperty(
+        name="Target Image",
+        description="Saved Macbeth chart calibration data to use as the target values",
+        type=bpy.types.Image,
+        poll=lambda self, obj: obj is not None and (
+            (getattr(obj, 'macblend_sample_data', None) is not None and obj.macblend_sample_data.is_saved) or
+            (getattr(obj, 'mb_sample_data', None) is not None and obj.mb_sample_data.is_saved)
+        ),
+    )
+    use_reference_target: BoolProperty(
+        name="Use reference values as target",
+        description="Use the selected colorspace reference values instead of sampled target image values",
+        default=True,
+    )
     normalize_calibration: BoolProperty(
         name="Normalize to Mid Grey",
         description="Match the Nuke behavior by pre-scaling source samples to the neutral patch before solving the calibration matrix.",
