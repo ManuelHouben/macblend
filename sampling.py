@@ -9,7 +9,6 @@ from bpy.props import (
     FloatProperty,
     FloatVectorProperty,
     IntProperty,
-    PointerProperty,
     StringProperty,
 )
 
@@ -235,7 +234,7 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
             corner.alpha = corner.alpha_highlight = 0.75
             corner.line_width = 3
             corner.use_draw_modal = True
-            operator = corner.target_set_operator('mbcalib.adjust_overlay_corner')
+            operator = corner.target_set_operator('macblend.adjust_overlay_corner')
             operator.corner_idx = corner_idx
             self.corners.append(corner)
 
@@ -322,7 +321,7 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
 
 
 class MB_OT_AdjustOverlayCorner(bpy.types.Operator):
-    bl_idname = 'mbcalib.adjust_overlay_corner'
+    bl_idname = 'macblend.adjust_overlay_corner'
     bl_label = 'Adjust Overlay Corner'
     bl_options = {'GRAB_CURSOR', 'BLOCKING', 'UNDO'}
 
@@ -397,6 +396,7 @@ class MB_ImageSampleData(bpy.types.PropertyGroup):
     overlay_opacity: FloatProperty(name="Overlay Opacity", default=0.5, min=0.0, max=1.0, subtype='FACTOR')
     source_name: StringProperty(name="Source Name", default="")
     show_overlay: BoolProperty(name="Show Overlay", default=True)
+    show_overlay_corners: BoolProperty(name="Overlay Corners", default=False)
     corner_tl: FloatVectorProperty(name="Top Left", size=2, default=(0.25, 0.82))
     corner_tr: FloatVectorProperty(name="Top Right", size=2, default=(0.75, 0.82))
     corner_br: FloatVectorProperty(name="Bottom Right", size=2, default=(0.75, 0.18))
@@ -404,7 +404,7 @@ class MB_ImageSampleData(bpy.types.PropertyGroup):
 
 
 class MB_OT_SampleImageColors(bpy.types.Operator):
-    bl_idname = "mbcalib.sample_image_colors"
+    bl_idname = "macblend.sample_image_colors"
     bl_label = "Sample Chart"
     bl_description = "Sample the 24 Macbeth patch values from the active image"
     bl_options = {'REGISTER', 'UNDO'}
@@ -445,7 +445,7 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
 
 
 class MB_OT_SaveSampleData(bpy.types.Operator):
-    bl_idname = "mbcalib.save_sample_data"
+    bl_idname = "macblend.save_sample_data"
     bl_label = "Save Sampled Values"
     bl_description = "Persist the sampled Macbeth values on the image datablock"
     bl_options = {'REGISTER', 'UNDO'}
@@ -468,7 +468,7 @@ class MB_OT_SaveSampleData(bpy.types.Operator):
 
 
 class MB_OT_ClearSampleData(bpy.types.Operator):
-    bl_idname = "mbcalib.clear_sample_data"
+    bl_idname = "macblend.clear_sample_data"
     bl_label = "Clear Sample Data"
     bl_description = "Clear the saved preview and saved state for an image"
     bl_options = {'REGISTER', 'UNDO'}
@@ -492,8 +492,8 @@ class MB_OT_ClearSampleData(bpy.types.Operator):
 class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
-    bl_label = 'Macbeth'
-    bl_category = 'Macbeth'
+    bl_label = 'MacBlend'
+    bl_category = 'MacBlend'
 
     def draw(self, context):
         layout = self.layout
@@ -509,18 +509,22 @@ class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
         row.prop(data, 'show_overlay')
         row.prop(data, 'overlay_opacity', slider=True)
 
-        box = layout.box()
-        box.label(text='Overlay Corners')
-        box.prop(data, 'corner_tl', text='Top Left')
-        box.prop(data, 'corner_tr', text='Top Right')
-        box.prop(data, 'corner_br', text='Bottom Right')
-        box.prop(data, 'corner_bl', text='Bottom Left')
+        corners_header = layout.row(align=True)
+        corners_icon = 'TRIA_DOWN' if data.show_overlay_corners else 'TRIA_RIGHT'
+        corners_header.prop(data, 'show_overlay_corners', text='Overlay Corners', icon=corners_icon, emboss=False)
+
+        if data.show_overlay_corners:
+            box = layout.box()
+            box.prop(data, 'corner_tl', text='Top Left')
+            box.prop(data, 'corner_tr', text='Top Right')
+            box.prop(data, 'corner_br', text='Bottom Right')
+            box.prop(data, 'corner_bl', text='Bottom Left')
 
         row = layout.row(align=True)
-        row.operator('mbcalib.sample_image_colors', text='Sample Chart')
+        row.operator('macblend.sample_image_colors', text='Sample Chart')
         save_row = row.row(align=True)
         save_row.enabled = data.has_preview
-        save_row.operator('mbcalib.save_sample_data', text='Save Values')
+        save_row.operator('macblend.save_sample_data', text='Save Values')
 
         if data.has_preview and len(data.samples) > 0:
             box = layout.box()
@@ -538,7 +542,7 @@ class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
             for img in saved_images:
                 row = box.row()
                 row.label(text=img.name)
-                row.operator('mbcalib.clear_sample_data', text='Clear', icon='X').image_name = img.name
+                row.operator('macblend.clear_sample_data', text='Clear', icon='X').image_name = img.name
 
 
 classes = (
@@ -553,24 +557,3 @@ classes = (
     MB_OT_ClearSampleData,
     MB_PT_ImageEditorSamplePanel,
 )
-
-
-def register():
-    for cls in classes:
-        bpy.utils.register_class(cls)
-    bpy.types.Image.mb_sample_data = PointerProperty(type=MB_ImageSampleData)
-    bpy.types.Image.macbeth_sample_data = PointerProperty(type=MB_ImageSampleData)
-
-
-def unregister():
-    for prop_name in ('mb_sample_data', 'macbeth_sample_data'):
-        try:
-            delattr(bpy.types.Image, prop_name)
-        except AttributeError:
-            pass
-
-    for cls in reversed(classes):
-        try:
-            bpy.utils.unregister_class(cls)
-        except RuntimeError:
-            pass

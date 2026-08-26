@@ -131,7 +131,7 @@ def get_target_colorspace_items(self, context):
         return items
 
 
-class MacbethCalibratorPreferences(bpy.types.AddonPreferences):
+class MacBlendCalibratorPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
 
     json_file_path: StringProperty(
@@ -167,12 +167,15 @@ class MacbethCalibratorPreferences(bpy.types.AddonPreferences):
             box.label(text="Warning: No valid JSON file found.", icon='ERROR')
 
 
-class MacbethCalibratorSettings(bpy.types.PropertyGroup):
+class MacBlendCalibratorSettings(bpy.types.PropertyGroup):
     sample_source_image: PointerProperty(
         name="Source Image",
         description="Saved Macbeth chart calibration data to use when creating the transform",
         type=bpy.types.Image,
-        poll=lambda self, obj: obj is not None and getattr(obj, 'mb_sample_data', None) is not None and obj.mb_sample_data.is_saved,
+        poll=lambda self, obj: obj is not None and (
+            (getattr(obj, 'macblend_sample_data', None) is not None and obj.macblend_sample_data.is_saved) or
+            (getattr(obj, 'mb_sample_data', None) is not None and obj.mb_sample_data.is_saved)
+        ),
     )
     create_exposure_node: BoolProperty(
         name="Create Exposure Node",
@@ -215,13 +218,13 @@ class MacbethCalibratorSettings(bpy.types.PropertyGroup):
     node_name: StringProperty(
         name="Node Name",
         description="Base name for the generated forward and inverse matrix nodes",
-        default="MacbethCalibration",
+        default="MacBlendCalibration",
     )
 
 
 classes = (
-    MacbethCalibratorPreferences,
-    MacbethCalibratorSettings,
+    MacBlendCalibratorPreferences,
+    MacBlendCalibratorSettings,
     sampling.MB_ColorSample,
     sampling.MB_ImageSampleData,
     sampling.MB_GT_OverlaySquare,
@@ -241,7 +244,9 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
-    bpy.types.Scene.macbeth_calibrator_settings = PointerProperty(type=MacbethCalibratorSettings)
+    bpy.types.Scene.macblend_calibrator_settings = PointerProperty(type=MacBlendCalibratorSettings)
+    bpy.types.Scene.macbeth_calibrator_settings = PointerProperty(type=MacBlendCalibratorSettings)
+    bpy.types.Image.macblend_sample_data = PointerProperty(type=sampling.MB_ImageSampleData)
     bpy.types.Image.macbeth_sample_data = PointerProperty(type=sampling.MB_ImageSampleData)
     bpy.types.Image.mb_sample_data = PointerProperty(type=sampling.MB_ImageSampleData)
     sampling.MB_Messagebus_Init()
@@ -258,11 +263,16 @@ def unregister():
         bpy.app.handlers.load_post.remove(sampling.MB_Messagebus_LoadPost)
 
     try:
+        del bpy.types.Scene.macblend_calibrator_settings
+    except (AttributeError, RuntimeError):
+        pass
+
+    try:
         del bpy.types.Scene.macbeth_calibrator_settings
     except (AttributeError, RuntimeError):
         pass
 
-    for prop_name in ('macbeth_sample_data', 'mb_sample_data'):
+    for prop_name in ('macblend_sample_data', 'macbeth_sample_data', 'mb_sample_data'):
         try:
             delattr(bpy.types.Image, prop_name)
         except (AttributeError, RuntimeError):

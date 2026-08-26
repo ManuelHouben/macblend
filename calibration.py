@@ -3,7 +3,6 @@ import math
 import json
 import os
 import numpy as np
-import mathutils
 
 from . import core
 
@@ -336,12 +335,14 @@ def build_matrix_node_group(tree_type):
 
 
 class MB_OT_CreateTransform(bpy.types.Operator):
-    bl_idname = "mbcalib.create_transform"
+    bl_idname = "macblend.create_transform"
     bl_label = "Create Transform"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        settings = context.scene.macbeth_calibrator_settings
+        settings = getattr(context.scene, 'macblend_calibrator_settings', None)
+        if settings is None:
+            settings = getattr(context.scene, 'macbeth_calibrator_settings', None)
         image = settings.sample_source_image
         if image is None or not getattr(image, 'mb_sample_data', None):
             self.report({'ERROR'}, "No valid saved source image selected.")
@@ -534,12 +535,14 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        settings = context.scene.macbeth_calibrator_settings
+        settings = getattr(context.scene, 'macblend_calibrator_settings', None)
+        if settings is None:
+            settings = getattr(context.scene, 'macbeth_calibrator_settings', None)
         layout.prop(settings, 'sample_source_image', text='Image')
         layout.prop(settings, 'target_colorspace', text='Target')
         layout.prop(settings, 'create_exposure_node', text='Create Exposure Node')
         layout.prop(settings, 'node_name', text='Node Name')
-        layout.operator('mbcalib.create_transform', text='Create Transform')
+        layout.operator('macblend.create_transform', text='Create Transform')
         if settings.calculation_done:
             box = layout.box()
             box.label(text='Matrix:')
@@ -551,16 +554,3 @@ classes = (
     MB_OT_CreateTransform,
     MB_PT_CalibrationPanel,
 )
-
-
-def register():
-    for cls in classes:
-        bpy.utils.register_class(cls)
-
-
-def unregister():
-    for cls in reversed(classes):
-        try:
-            bpy.utils.unregister_class(cls)
-        except RuntimeError:
-            pass
