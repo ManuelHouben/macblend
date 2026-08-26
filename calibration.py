@@ -1,8 +1,13 @@
-import bpy
 import math
-import numpy as np
+import importlib
+import os
+import tempfile
 
-from . import colorspaces, core, sampling
+import bpy
+import numpy as np
+from bpy.props import BoolProperty, EnumProperty, StringProperty
+
+from . import colorspaces, core, lut_writer, sampling
 
 
 MB_OWNER_KEY = "macblend_owner"
@@ -355,7 +360,13 @@ def build_matrix_node_group(tree_type):
     return group
 
 
-def _prepare_calibration_data(self, context):
+def _prepare_calibration_data(
+    self,
+    context,
+    *,
+    require_editor=True,
+    normalize_matrix_input=True,
+):
     settings = getattr(context.scene, 'macblend_calibrator_settings', None)
     if settings is None:
         return None, None, None, None, None
@@ -365,15 +376,18 @@ def _prepare_calibration_data(self, context):
         self.report({'ERROR'}, "No valid saved source image selected.")
         return None, None, None, None, None
 
-    editor_kind = _get_editor_kind(getattr(context, 'space_data', None))
-    if editor_kind is None:
-        self.report({'ERROR'}, "This operator only works in Shader or Compositor Node Editor.")
-        return None, None, None, None, None
+    editor_kind = None
+    tree = None
+    if require_editor:
+        editor_kind = _get_editor_kind(getattr(context, 'space_data', None))
+        if editor_kind is None:
+            self.report({'ERROR'}, "This operator only works in Shader or Compositor Node Editor.")
+            return None, None, None, None, None
 
-    tree = getattr(context.space_data, 'edit_tree', None)
-    if tree is None:
-        self.report({'ERROR'}, "This panel only works in the Shader or Compositor editor.")
-        return None, None, None, None, None
+        tree = getattr(context.space_data, 'edit_tree', None)
+        if tree is None:
+            self.report({'ERROR'}, "This panel only works in the Shader or Compositor editor.")
+            return None, None, None, None, None
 
     source_samples = _ordered_image_samples(image)
     if source_samples is None:
@@ -442,7 +456,8 @@ def _prepare_calibration_data(self, context):
 
         if src_luma > 1e-7:
             normalization_factor = ref_luma / src_luma
-            matrix_input = source_samples * normalization_factor
+            if normalize_matrix_input:
+                matrix_input = source_samples * normalization_factor
             if debug_logging:
                 print(f"[MacBlend] Normalization factor = {normalization_factor}", flush=True)
         else:
@@ -475,6 +490,122 @@ def _prepare_calibration_data(self, context):
     )
 
     return settings, editor_kind, tree, matrix_3x3, normalization_factor
+
+
+def _scene_linear_working_space(scene):
+    try:
+        ocio = importlib.import_module('PyOpenColorIO')
+        name = ocio.GetCurrentConfig().getRoleColorSpace('scene_linear')
+        if name:
+            return name, False
+    except (ImportError, AttributeError, RuntimeError):
+        pass
+
+    sequencer_settings = getattr(scene, 'sequencer_colorspace_settings', None)
+    name = getattr(sequencer_settings, 'name', '')
+    if name:
+        return name, True
+    raise ValueError("Could not resolve Blender's scene-linear working colorspace.")
+
+
+def _lut_target_name(settings):
+    if settings.use_reference_target:
+        return settings.target_colorspace or "LINEAR_SRGB_D65"
+    return lut_writer.image_name_token(settings.sample_target_image.name)
+
+
+def _build_lut_exports(operator, context, *, size, clamp):
+    settings, _editor_kind, _tree, matrix_3x3, normalization_factor = _prepare_calibration_data(
+        operator,
+        context,
+        require_editor=False,
+        normalize_matrix_input=False,
+    )
+    if settings is None:
+        return None
+
+    try:
+        working_space, used_fallback = _scene_linear_working_space(context.scene)
+        neutralize_matrix, match_matrix = lut_writer.compose_export_matrices(
+            matrix_3x3,
+            normalization_factor,
+        )
+    except ValueError as exc:
+        operator.report({'ERROR'}, str(exc))
+        return None
+
+    if used_fallback:
+        operator.report({'WARNING'}, "Using Blender's sequencer colorspace as the working-space name.")
+
+    source_name = lut_writer.image_name_token(settings.sample_source_image.name)
+    target_name = _lut_target_name(settings)
+    normalized = bool(settings.normalize_calibration)
+    exports = []
+    for mode, matrix in (("Match", match_matrix), ("Neutralize", neutralize_matrix)):
+        filename = lut_writer.build_lut_filename(
+            working_space,
+            source_name,
+            target_name,
+            normalized=normalized,
+            mode=mode,
+        )
+        lines = lut_writer.generate_cube_lut(matrix, size=size, title=filename[:-5], clamp=clamp)
+        exports.append((filename, "\n".join(lines) + "\n"))
+    return exports
+
+
+def _write_lut_exports(directory, exports):
+    staged_paths = []
+    try:
+        for filename, contents in exports:
+            descriptor, staged_path = tempfile.mkstemp(
+                prefix=f".{filename}.",
+                suffix='.tmp',
+                dir=directory,
+                text=True,
+            )
+            with os.fdopen(descriptor, 'w', encoding='utf-8', newline='\n') as output_file:
+                output_file.write(contents)
+            staged_paths.append((staged_path, os.path.join(directory, filename)))
+
+        for staged_path, final_path in staged_paths:
+            os.replace(staged_path, final_path)
+    finally:
+        for staged_path, _final_path in staged_paths:
+            if os.path.exists(staged_path):
+                os.remove(staged_path)
+
+
+def _execute_lut_export(operator, context, *, directory, size, clamp, overwrite):
+    directory = bpy.path.abspath(directory)
+    if not os.path.isdir(directory):
+        operator.report({'ERROR'}, "Select an existing export directory.")
+        return {'CANCELLED'}
+
+    exports = _build_lut_exports(operator, context, size=size, clamp=clamp)
+    if exports is None:
+        return {'CANCELLED'}
+
+    final_paths = [os.path.join(directory, filename) for filename, _contents in exports]
+    collisions = [path for path in final_paths if os.path.exists(path)]
+    if collisions and not overwrite:
+        bpy.ops.macblend.confirm_lut_overwrite(
+            'INVOKE_DEFAULT',
+            directory=directory,
+            lut_size=str(size),
+            clamp_output=clamp,
+            existing_files='\n'.join(os.path.basename(path) for path in collisions),
+        )
+        return {'FINISHED'}
+
+    try:
+        _write_lut_exports(directory, exports)
+    except OSError as exc:
+        operator.report({'ERROR'}, f"Could not write LUT files: {exc}")
+        return {'CANCELLED'}
+
+    operator.report({'INFO'}, f"Exported Match and Neutralize LUTs to '{directory}'.")
+    return {'FINISHED'}
 
 
 def _create_matrix_node(tree, editor_kind, node_name, matrix_3x3, *, label_text, location):
@@ -623,6 +754,82 @@ class MB_OT_NeutralizeTransform(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MB_OT_ExportLuts(bpy.types.Operator):
+    bl_idname = "macblend.export_luts"
+    bl_label = "Export LUTs"
+    bl_description = (
+        "Export Match and Neutralize LUTs named "
+        "WorkingSpace_InputImage_Target[_normalized]_Mode.cube"
+    )
+    bl_options = {'REGISTER'}
+
+    directory: StringProperty(name="Export Directory", subtype='DIR_PATH')
+    lut_size: EnumProperty(
+        name="LUT Size",
+        items=(('17', "17", "17x17x17"), ('33', "33", "33x33x33"), ('65', "65", "65x65x65")),
+        default='33',
+    )
+    clamp_output: BoolProperty(
+        name="Clamp to 0-1",
+        description="Clamp LUT output values for broad application compatibility",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return _target_is_selected(context)
+
+    def invoke(self, context, event):
+        if not self.directory:
+            self.directory = bpy.path.abspath('//') if bpy.data.filepath else os.path.expanduser('~')
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        return _execute_lut_export(
+            self,
+            context,
+            directory=self.directory,
+            size=int(self.lut_size),
+            clamp=self.clamp_output,
+            overwrite=False,
+        )
+
+
+class MB_OT_ConfirmLutOverwrite(bpy.types.Operator):
+    bl_idname = "macblend.confirm_lut_overwrite"
+    bl_label = "Replace Existing LUT Files?"
+
+    directory: StringProperty(options={'HIDDEN'}, subtype='DIR_PATH')
+    lut_size: EnumProperty(
+        options={'HIDDEN'},
+        items=(('17', "17", ""), ('33', "33", ""), ('65', "65", "")),
+        default='33',
+    )
+    clamp_output: BoolProperty(options={'HIDDEN'}, default=False)
+    existing_files: StringProperty(options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=500)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="The following LUT files already exist:", icon='ERROR')
+        for filename in self.existing_files.splitlines():
+            layout.label(text=filename)
+        layout.label(text="Both Match and Neutralize LUTs will be exported.")
+
+    def execute(self, context):
+        return _execute_lut_export(
+            self,
+            context,
+            directory=self.directory,
+            size=int(self.lut_size),
+            clamp=self.clamp_output,
+            overwrite=True,
+        )
+
+
 class MB_PT_CalibrationPanel(bpy.types.Panel):
     bl_space_type = 'NODE_EDITOR'
     bl_region_type = 'UI'
@@ -648,6 +855,7 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator('macblend.match_transform', text='Match')
         row.operator('macblend.neutralize_transform', text='Neutralize')
+        layout.operator('macblend.export_luts', text='Export LUTs', icon='EXPORT')
         if settings.calculation_done:
             box = layout.box()
             box.label(text='Matrix:')
@@ -658,5 +866,7 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
 classes = (
     MB_OT_MatchTransform,
     MB_OT_NeutralizeTransform,
+    MB_OT_ExportLuts,
+    MB_OT_ConfirmLutOverwrite,
     MB_PT_CalibrationPanel,
 )
