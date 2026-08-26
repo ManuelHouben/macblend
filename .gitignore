@@ -190,6 +190,7 @@ cython_debug/
 # .vscode/
 blender_vscode_development/
 ref/
+tests/
 
 # Ruff stuff:
 .ruff_cache/

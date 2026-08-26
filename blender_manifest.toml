@@ -17,6 +17,7 @@ files = "Read bundled color-transform data and user-selected JSON files"
 paths = [
 	"__init__.py",
 	"calibration.py",
+	"colorspaces.py",
 	"core.py",
 	"LICENSE",
 	"mmColorTarget_colorspace_transforms.json",

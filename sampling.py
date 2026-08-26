@@ -1,7 +1,8 @@
 import numpy as np
 import bpy
-from .core import sample_image_color
+from . import core
 from mathutils import Vector
+from time import perf_counter
 from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty,
@@ -13,11 +14,6 @@ from bpy.props import (
 )
 
 
-class MB_TempData:
-    current_image = None
-
-
-MB_TEMP = MB_TempData()
 MB_MSGBUS_OWNER = object()
 MB_OVERLAY_RENDER_ALPHA_MAX = 0.999
 MB_FLIP_BUTTON_SCALE = 48.0
@@ -95,6 +91,7 @@ MB_MACBETH_PATCH_NAMES = (
 MB_CCMASTER = tuple((slot, name) for slot, name in enumerate(MB_MACBETH_PATCH_NAMES))
 
 MB_SAMPLE_PROPERTY_NAMES = tuple(f"sample_patch_{index + 1:02d}" for index in range(24))
+_MB_SYNCING_SAMPLE_SELECTION = False
 
 
 def _lerp_2d(point_a, point_b, factor):
@@ -104,10 +101,10 @@ def _lerp_2d(point_a, point_b, factor):
     )
 
 
-def _grid_point(corners, u, v):
-    top = _lerp_2d(corners[0], corners[1], u)
-    bottom = _lerp_2d(corners[3], corners[2], u)
-    return _lerp_2d(bottom, top, v)
+def _grid_point(corners, u, v, homography=None):
+    if homography is None:
+        homography = core.build_chart_homography(corners)
+    return core.map_chart_point(homography, u, v)
 
 
 def _get_overlay_corners(data, image):
@@ -137,15 +134,68 @@ def _tag_image_editor_redraw():
                 area.tag_redraw()
 
 
-def _safe_sample_patch_bounds(width, height, center_x, center_y, patch_size):
-    from . import clamp_sample_region
-
-    return clamp_sample_region((width, height), center_x, center_y, patch_size)
-
-
 def _set_sample_patch_value(data, sample_idx, rgb_value):
     if 0 <= sample_idx < len(MB_SAMPLE_PROPERTY_NAMES):
         setattr(data, MB_SAMPLE_PROPERTY_NAMES[sample_idx], tuple(rgb_value))
+
+
+def image_has_sample_values(image):
+    data = getattr(image, 'mb_sample_data', None)
+    if data is None or len(data.samples) != len(MB_CCMASTER):
+        return False
+
+    patch_indices = {int(getattr(sample, 'patch_index', -1)) for sample in data.samples}
+    return patch_indices == set(range(len(MB_CCMASTER)))
+
+
+def _image_index(image):
+    if image is None:
+        return -1
+    return next((index for index, candidate in enumerate(bpy.data.images) if candidate == image), -1)
+
+
+def _selected_sample_image(scene):
+    ui_state = getattr(scene, 'macblend_sampling_ui', None)
+    if ui_state is None:
+        return None
+
+    index = int(ui_state.active_image_index)
+    if not 0 <= index < len(bpy.data.images):
+        return None
+
+    image = bpy.data.images[index]
+    return image if image_has_sample_values(image) else None
+
+
+def _set_selected_sample_image(scene, image):
+    global _MB_SYNCING_SAMPLE_SELECTION
+    ui_state = getattr(scene, 'macblend_sampling_ui', None)
+    if ui_state is None:
+        return
+
+    index = _image_index(image) if image_has_sample_values(image) else -1
+    _MB_SYNCING_SAMPLE_SELECTION = True
+    try:
+        ui_state.active_image_index = index
+    finally:
+        _MB_SYNCING_SAMPLE_SELECTION = False
+
+
+def _active_sample_image_changed(ui_state, context):
+    if _MB_SYNCING_SAMPLE_SELECTION:
+        return
+
+    image = _selected_sample_image(context.scene)
+    if image is None:
+        if ui_state.active_image_index != -1:
+            _set_selected_sample_image(context.scene, None)
+        _tag_image_editor_redraw()
+        return
+
+    space_data = getattr(context, 'space_data', None)
+    if getattr(space_data, 'type', None) == 'IMAGE_EDITOR':
+        space_data.image = image
+    _tag_image_editor_redraw()
 
 
 def _ccmaster_patch_uv(slot):
@@ -156,18 +206,66 @@ def _ccmaster_patch_uv(slot):
     return u, v
 
 
-def _build_ccmaster_patch_centers(data, corners):
-    data.patch_centers.clear()
+def _calculate_ccmaster_patch_centers(corners):
+    homography = core.build_chart_homography(corners)
+    centers = []
     for slot, patch_name in MB_CCMASTER:
         u, v = _ccmaster_patch_uv(slot)
-        center_x, center_y = _grid_point(corners, u, v)
+        center_x, center_y = core.map_chart_point(homography, u, v)
+        centers.append((slot, patch_name, center_x, center_y))
+    return centers
+
+
+def _store_patch_centers(data, centers):
+    data.patch_centers.clear()
+    for slot, patch_name, center_x, center_y in centers:
         patch = data.patch_centers.add()
         patch.slot = slot
         patch.patch_name = patch_name
         patch.x = center_x
         patch.y = center_y
 
-    return data.patch_centers
+
+def _replace_sample_data(data, centers, sampled_values):
+    data.samples.clear()
+    _reset_sample_patch_values(data)
+    _store_patch_centers(data, centers)
+    for slot, _patch_name, sample_rgb in sampled_values:
+        sample = data.samples.add()
+        sample.patch_index = slot
+        sample.rgb = sample_rgb
+        _set_sample_patch_value(data, slot, sample.rgb)
+
+
+def _load_image_pixel_buffer(image):
+    width, height = image.size
+    channels = int(image.channels)
+    if channels not in {1, 2, 3, 4}:
+        raise ValueError(f"Unsupported image channel count: {channels}.")
+    if width <= 0 or height <= 0:
+        raise ValueError("Image has no sampleable pixel area.")
+
+    expected_values = int(width) * int(height) * channels
+    actual_values = len(image.pixels)
+    if actual_values != expected_values:
+        raise ValueError(
+            f"Image pixel buffer has {actual_values} values; expected {expected_values}."
+        )
+
+    byte_count = expected_values * np.dtype(np.float32).itemsize
+    try:
+        pixels = np.empty(expected_values, dtype=np.float32)
+    except MemoryError as exc:
+        required_mib = byte_count / (1024.0 * 1024.0)
+        raise MemoryError(
+            f"Could not allocate {required_mib:.1f} MiB for the image pixel buffer."
+        ) from exc
+
+    try:
+        image.pixels.foreach_get(pixels)
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(f"Could not transfer Blender image pixels: {exc}") from exc
+    return pixels.reshape((height, width, channels))
 
 
 def _center_overlay_corners(data, image_width, image_height, chart_aspect_ratio=MB_CHART_ASPECT_RATIO, area_fraction=MB_CHART_AREA_FRACTION):
@@ -215,33 +313,15 @@ def _reset_sample_patch_values(data):
         setattr(data, prop_name, MB_MACBETH_REFERENCE_SRGB[sample_idx])
 
 
-def _initialize_overlay_defaults(image):
-    if image is None:
-        return
-
-    data = getattr(image, 'mb_sample_data', None)
-    if data is None or data.overlay_defaults_initialized:
-        return
-
-    if getattr(image, 'source', None) == 'VIEWER':
-        data.show_overlay = False
-        data.show_overlay_corners = False
-
-    data.overlay_defaults_initialized = True
+def _get_show_overlay(data):
+    stored_value = data.get('show_overlay')
+    if stored_value is not None:
+        return bool(stored_value)
+    return getattr(data.id_data, 'source', None) != 'VIEWER'
 
 
-def _init_current_image():
-    current_image = None
-    for window in bpy.context.window_manager.windows:
-        for area in window.screen.areas:
-            if area.type == 'IMAGE_EDITOR' and area.spaces.active.image is not None:
-                current_image = area.spaces.active.image
-                break
-        if current_image is not None:
-            break
-
-    MB_TEMP.current_image = current_image
-    _initialize_overlay_defaults(current_image)
+def _set_show_overlay(data, value):
+    data['show_overlay'] = bool(value)
 
 
 @persistent
@@ -256,7 +336,10 @@ def MB_Messagebus_Init(*args):
 
 
 def MB_ImageEditor_Changed():
-    _init_current_image()
+    scene = getattr(bpy.context, 'scene', None)
+    space_data = getattr(bpy.context, 'space_data', None)
+    if scene is not None and getattr(space_data, 'type', None) == 'IMAGE_EDITOR':
+        _set_selected_sample_image(scene, getattr(space_data, 'image', None))
     _tag_image_editor_redraw()
 
 
@@ -392,7 +475,7 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
 
     @classmethod
     def poll(cls, context):
-        image = getattr(getattr(context, 'space_data', None), 'image', None) or MB_TEMP.current_image
+        image = getattr(getattr(context, 'space_data', None), 'image', None)
         return image is not None and getattr(image, 'mb_sample_data', None) is not None and image.mb_sample_data.show_overlay
 
     def setup(self, context):
@@ -506,8 +589,8 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
         gizmo.matrix_basis[0][3] = region_point[0]
         gizmo.matrix_basis[1][3] = region_point[1]
 
-    def _offset_from_chart(self, corners, base_point):
-        center = _grid_point(corners, 0.5, 0.5)
+    def _offset_from_chart(self, corners, base_point, homography):
+        center = _grid_point(corners, 0.5, 0.5, homography)
         direction = (base_point[0] - center[0], base_point[1] - center[1])
         length = max((direction[0] ** 2 + direction[1] ** 2) ** 0.5, 1e-6)
         scale = 0.04
@@ -521,7 +604,7 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
             self.flip_buttons = []
         self._ensure_flip_buttons()
 
-        image = getattr(getattr(context, 'space_data', None), 'image', None) or MB_TEMP.current_image
+        image = getattr(getattr(context, 'space_data', None), 'image', None)
         if image is None or not getattr(image, 'mb_sample_data', None) or not image.mb_sample_data.show_overlay:
             for gizmo in self.outlines + self.fills + self.corners + self.flip_buttons:
                 gizmo.hide = True
@@ -534,6 +617,12 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
             return
 
         corners = _get_overlay_corners(image.mb_sample_data, image)
+        try:
+            homography = core.build_chart_homography(corners)
+        except ValueError:
+            for gizmo in self.outlines + self.fills + self.corners + self.flip_buttons:
+                gizmo.hide = True
+            return
         # Blender gizmo triangle fills can show internal seams at exactly 1.0 alpha.
         # Keep render alpha infinitesimally below opaque to avoid the artifact.
         overlay_alpha = min(float(image.mb_sample_data.overlay_opacity), MB_OVERLAY_RENDER_ALPHA_MAX)
@@ -548,7 +637,7 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
         }
         for index in range(len(MB_CCMASTER)):
             u, v = _ccmaster_patch_uv(index)
-            center = _grid_point(corners, u, v)
+            center = _grid_point(corners, u, v, homography)
             cell_points = (
                 (center[0] - half_width, center[1] - half_height),
                 (center[0] + half_width, center[1] - half_height),
@@ -576,11 +665,11 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
         tl, tr, br, bl = corners
 
         horizontal_base = _lerp_2d(tl, tr, 0.5)
-        horizontal_point = self._offset_from_chart(corners, horizontal_base)
+        horizontal_point = self._offset_from_chart(corners, horizontal_base, homography)
         self._set_flip_button(self.flip_buttons[0], context, horizontal_point, tl, tr)
 
         vertical_base = _lerp_2d(tl, bl, 0.5)
-        vertical_point = self._offset_from_chart(corners, vertical_base)
+        vertical_point = self._offset_from_chart(corners, vertical_base, homography)
         self._set_flip_button(self.flip_buttons[1], context, vertical_point, tl, bl)
 
 
@@ -601,7 +690,7 @@ class MB_OT_AdjustOverlayCorner(bpy.types.Operator):
         return cls.bl_label
 
     def invoke(self, context, event):
-        image = getattr(context.space_data, 'image', None) or MB_TEMP.current_image
+        image = getattr(getattr(context, 'space_data', None), 'image', None)
         if image is None or not getattr(image, 'mb_sample_data', None):
             return {'CANCELLED'}
 
@@ -652,7 +741,7 @@ class MB_OT_FlipOverlayHorizontal(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        image = getattr(getattr(context, 'space_data', None), 'image', None) or MB_TEMP.current_image
+        image = getattr(getattr(context, 'space_data', None), 'image', None)
         if image is None or not getattr(image, 'mb_sample_data', None):
             self.report({'ERROR'}, 'No image with Macbeth overlay data available.')
             return {'CANCELLED'}
@@ -678,7 +767,7 @@ class MB_OT_FlipOverlayVertical(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        image = getattr(getattr(context, 'space_data', None), 'image', None) or MB_TEMP.current_image
+        image = getattr(getattr(context, 'space_data', None), 'image', None)
         if image is None or not getattr(image, 'mb_sample_data', None):
             self.report({'ERROR'}, 'No image with Macbeth overlay data available.')
             return {'CANCELLED'}
@@ -704,7 +793,7 @@ class MB_OT_CenterOverlayChart(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        image = getattr(getattr(context, 'space_data', None), 'image', None) or MB_TEMP.current_image
+        image = getattr(getattr(context, 'space_data', None), 'image', None)
         if image is None or not getattr(image, 'mb_sample_data', None):
             self.report({'ERROR'}, 'No image with Macbeth overlay data available.')
             return {'CANCELLED'}
@@ -753,14 +842,10 @@ class MB_ChartPatchCenter(bpy.types.PropertyGroup):
 class MB_ImageSampleData(bpy.types.PropertyGroup):
     samples: CollectionProperty(type=MB_ColorSample)
     patch_centers: CollectionProperty(type=MB_ChartPatchCenter)
-    has_preview: BoolProperty(name="Preview Available", default=False)
-    is_saved: BoolProperty(name="Saved in Blend", default=False)
-    overlay_defaults_initialized: BoolProperty(name="Overlay Defaults Initialized", default=False)
     patch_size: IntProperty(name="Patch Size", default=30, min=1, max=200)
     overlay_opacity: FloatProperty(name="Overlay Opacity", default=0.5, min=0.0, max=1.0, subtype='FACTOR')
-    source_name: StringProperty(name="Source Name", default="")
-    show_overlay: BoolProperty(name="Show Overlay", default=True)
-    show_overlay_corners: BoolProperty(name="Overlay Corners", default=False)
+    show_overlay: BoolProperty(name="Show Overlay", get=_get_show_overlay, set=_set_show_overlay)
+    show_overlay_corners: BoolProperty(name="Corner Positions", default=False)
     corner_tl: FloatVectorProperty(name="Top Left", size=2, default=(0.25, 0.82))
     corner_tr: FloatVectorProperty(name="Top Right", size=2, default=(0.75, 0.82))
     corner_br: FloatVectorProperty(name="Bottom Right", size=2, default=(0.75, 0.18))
@@ -780,6 +865,38 @@ for sample_idx, prop_name in enumerate(MB_SAMPLE_PROPERTY_NAMES):
     )
 
 
+class MB_SamplingUIState(bpy.types.PropertyGroup):
+    active_image_index: IntProperty(
+        name="Active Sampled Image",
+        default=-1,
+        min=-1,
+        update=_active_sample_image_changed,
+    )
+
+
+if not hasattr(MB_SamplingUIState, '__annotations__'):
+    MB_SamplingUIState.__annotations__ = {}
+
+for sample_idx, prop_name in enumerate(MB_SAMPLE_PROPERTY_NAMES):
+    MB_SamplingUIState.__annotations__[prop_name] = FloatVectorProperty(
+        name=MB_MACBETH_PATCH_NAMES[sample_idx],
+        description=f"Reference sRGB color for patch: {MB_MACBETH_PATCH_NAMES[sample_idx]}",
+        size=3,
+        subtype='COLOR',
+        default=MB_MACBETH_REFERENCE_SRGB[sample_idx],
+    )
+
+
+class MB_UL_SampledImages(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        layout.label(text=item.name, icon='IMAGE_DATA')
+
+    def filter_items(self, context, data, property_name):
+        images = getattr(data, property_name)
+        flags = [self.bitflag_filter_item if image_has_sample_values(image) else 0 for image in images]
+        return flags, []
+
+
 class MB_OT_SampleImageColors(bpy.types.Operator):
     bl_idname = "macblend.sample_image_colors"
     bl_label = "Sample Chart"
@@ -792,97 +909,82 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
             self.report({'ERROR'}, "No image selected in the Image Editor.")
             return {'CANCELLED'}
 
-        data = image.mb_sample_data
-        data.samples.clear()
-        data.patch_centers.clear()
-        _reset_sample_patch_values(data)
-
         width, height = image.size
         if width <= 0 or height <= 0:
             self.report({'ERROR'}, "Selected image has no valid pixel resolution.")
             return {'CANCELLED'}
 
-        pixels = np.asarray(image.pixels, dtype=np.float32).reshape((height, width, image.channels))
+        data = image.mb_sample_data
         overlay_corners = _get_overlay_corners(data, image)
         debug_logging = _debug_logging_enabled(context)
         if debug_logging:
             print(f"[MacBlend] User overlay corners: {overlay_corners}", flush=True)
-        _build_ccmaster_patch_centers(data, overlay_corners)
         sample_size = max(1, min(int(data.patch_size), max(width, height)))
         if debug_logging:
             print("[MacBlend] Sample Chart debug:", flush=True)
 
-        for patch in data.patch_centers:
-            slot = int(patch.slot)
-            patch_name = patch.patch_name or MB_MACBETH_PATCH_NAMES[slot] if slot < len(MB_MACBETH_PATCH_NAMES) else f"slot_{slot}"
-            x = max(0, min(width - 1, int(round(float(patch.x) * width))))
-            y = max(0, min(height - 1, int(round(float(patch.y) * height))))
-
-            sample_rgb = sample_image_color(pixels, width, height, x, y, sample_size)
-            sample = data.samples.add()
-            sample.patch_index = slot
-            sample.rgb = sample_rgb
-            _set_sample_patch_value(data, slot, sample.rgb)
+        try:
+            centers = _calculate_ccmaster_patch_centers(overlay_corners)
+            transfer_started = perf_counter()
+            pixel_buffer = _load_image_pixel_buffer(image)
+            transfer_seconds = perf_counter() - transfer_started
+            averaging_started = perf_counter()
+            sampled_values = []
+            for slot, patch_name, center_x, center_y in centers:
+                x = float(center_x) * width
+                y = float(center_y) * height
+                sample_rgb = core.sample_pixel_buffer(pixel_buffer, x, y, sample_size)
+                sampled_values.append((slot, patch_name, sample_rgb))
+                if debug_logging:
+                    print(f"  slot[{slot}] {patch_name} -> {tuple(float(v) for v in sample_rgb)}", flush=True)
+            averaging_seconds = perf_counter() - averaging_started
             if debug_logging:
-                print(f"  slot[{slot}] {patch_name} -> {tuple(float(v) for v in sample_rgb)}", flush=True)
+                buffer_mib = pixel_buffer.nbytes / (1024.0 * 1024.0)
+                print(
+                    f"[MacBlend] Bulk pixel transfer: {transfer_seconds:.4f}s "
+                    f"({buffer_mib:.1f} MiB); 24 patch averages: {averaging_seconds:.4f}s",
+                    flush=True,
+                )
+        except (ValueError, MemoryError) as exc:
+            self.report({'ERROR'}, f"Could not sample chart: {exc}")
+            return {'CANCELLED'}
 
-        data.has_preview = True
-        data.is_saved = False
+        _replace_sample_data(data, centers, sampled_values)
+        data.show_overlay = False
+        data.show_overlay_corners = False
+        _set_selected_sample_image(context.scene, image)
         _tag_image_editor_redraw()
         self.report({'INFO'}, f"Sampled {len(data.samples)} values from '{image.name}'.")
         return {'FINISHED'}
 
 
-class MB_OT_SaveSampleData(bpy.types.Operator):
-    bl_idname = "macblend.save_sample_data"
-    bl_label = "Save Sampled Values"
-    bl_description = "Persist the sampled Macbeth values on the image datablock"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        image = getattr(context.space_data, 'image', None)
-        if image is None:
-            self.report({'ERROR'}, "No image selected in the Image Editor.")
-            return {'CANCELLED'}
-
-        data = image.mb_sample_data
-        if not data.has_preview or len(data.samples) == 0:
-            self.report({'WARNING'}, "There are no sampled values to save.")
-            return {'CANCELLED'}
-
-        data.is_saved = True
-        data.source_name = image.name
-        data.corner_tl = tuple(data.corner_tl)
-        data.corner_tr = tuple(data.corner_tr)
-        data.corner_br = tuple(data.corner_br)
-        data.corner_bl = tuple(data.corner_bl)
-        if data.show_overlay:
-            data.show_overlay = False
-            data.show_overlay_corners = False
-            _tag_image_editor_redraw()
-        self.report({'INFO'}, f"Saved Macbeth values for '{image.name}'.")
-        return {'FINISHED'}
-
-
 class MB_OT_ClearSampleData(bpy.types.Operator):
     bl_idname = "macblend.clear_sample_data"
-    bl_label = "Clear Sample Data"
-    bl_description = "Clear the saved preview and saved state for an image"
+    bl_label = "Delete Sample Values"
+    bl_description = "Delete the sampled Macbeth values from the highlighted image"
     bl_options = {'REGISTER', 'UNDO'}
 
-    image_name: StringProperty(default="")
+    @classmethod
+    def poll(cls, context):
+        return _selected_sample_image(context.scene) is not None
 
     def execute(self, context):
-        image = bpy.data.images.get(self.image_name)
+        image = _selected_sample_image(context.scene)
         if image is None:
             return {'CANCELLED'}
 
         data = image.mb_sample_data
         data.samples.clear()
+        data.patch_centers.clear()
         _reset_sample_patch_values(data)
-        data.has_preview = False
-        data.is_saved = False
-        data.source_name = ""
+        settings = getattr(context.scene, 'macblend_calibrator_settings', None)
+        if settings is not None:
+            if settings.sample_source_image == image:
+                settings.sample_source_image = None
+            if settings.sample_target_image == image:
+                settings.sample_target_image = None
+        _set_selected_sample_image(context.scene, None)
+        _tag_image_editor_redraw()
         self.report({'INFO'}, f"Cleared sample data for '{image.name}'.")
         return {'FINISHED'}
 
@@ -898,68 +1000,72 @@ class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
         image = getattr(context.space_data, 'image', None)
         if image is None:
             layout.label(text="Select an image")
-            return
+        else:
+            data = image.mb_sample_data
+            layout.label(text=f"Image: {image.name}")
+            layout.prop(data, 'patch_size')
+            overlay_row = layout.row(align=True)
+            overlay_row.prop(data, 'show_overlay')
+            overlay_row.prop(data, 'overlay_opacity', slider=True)
 
-        data = image.mb_sample_data
-        layout.label(text=f"Image: {image.name}")
-        layout.prop(data, 'patch_size')
-        overlay_row = layout.row(align=True)
-        overlay_row.prop(data, 'show_overlay')
-        overlay_row.prop(data, 'overlay_opacity', slider=True)
-
-        corners_header = layout.row(align=True)
-        corners_icon = 'TRIA_DOWN' if data.show_overlay_corners else 'TRIA_RIGHT'
-        corners_header.prop(data, 'show_overlay_corners', text='Overlay Corners', icon=corners_icon, emboss=False)
-
-        if not data.show_overlay_corners:
-            center_row = layout.row(align=True)
-            center_row.enabled = not data.is_saved
-            center_row.operator('macblend.center_overlay_chart', text='Center Overlay')
-
-        if data.show_overlay_corners:
-            box = layout.box()
-            box.prop(data, 'corner_tl', text='Top Left')
-            box.prop(data, 'corner_tr', text='Top Right')
-            box.prop(data, 'corner_br', text='Bottom Right')
-            box.prop(data, 'corner_bl', text='Bottom Left')
-            flip_row = box.row(align=True)
+            alignment_box = layout.box()
+            alignment_box.label(text='Chart Alignment')
+            alignment_box.operator('macblend.center_overlay_chart', text='Center Overlay')
+            flip_row = alignment_box.row(align=True)
             flip_row.operator('macblend.flip_overlay_horizontal', text='Flip Horizontal')
             flip_row.operator('macblend.flip_overlay_vertical', text='Flip Vertical')
-            center_row = box.row(align=True)
-            center_row.enabled = not data.is_saved
-            center_row.operator('macblend.center_overlay_chart', text='Center Overlay')
 
-        row = layout.row(align=True)
-        row.operator('macblend.sample_image_colors', text='Sample Chart')
-        save_row = row.row(align=True)
-        save_row.enabled = data.has_preview
-        save_row.operator('macblend.save_sample_data', text='Save Values')
+            corners_header = alignment_box.row(align=True)
+            corners_icon = 'TRIA_DOWN' if data.show_overlay_corners else 'TRIA_RIGHT'
+            corners_header.prop(data, 'show_overlay_corners', text='Corner Positions', icon=corners_icon, emboss=False)
 
-        if data.has_preview and len(data.samples) > 0:
-            box = layout.box()
-            box.label(text='Sampled Values')
-            samples_col = box.column(align=True)
-            for display_row in range(4):
-                ui_row = samples_col.row(align=True)
-                for col_idx in range(6):
-                    sample_idx = display_row * 6 + col_idx
-                    cell = ui_row.column(align=True)
-                    cell.prop(data, MB_SAMPLE_PROPERTY_NAMES[sample_idx], text='')
+            if data.show_overlay_corners:
+                corners_column = alignment_box.column(align=True)
+                corners_column.prop(data, 'corner_tl', text='Top Left')
+                corners_column.prop(data, 'corner_tr', text='Top Right')
+                corners_column.prop(data, 'corner_br', text='Bottom Right')
+                corners_column.prop(data, 'corner_bl', text='Bottom Left')
 
-        saved_images = [img for img in bpy.data.images if getattr(img, 'mb_sample_data', None) and img.mb_sample_data.is_saved]
-        if saved_images:
-            box = layout.box()
-            box.label(text='Saved Images')
-            for img in saved_images:
-                row = box.row()
-                row.label(text=img.name)
-                row.operator('macblend.clear_sample_data', text='Clear', icon='X').image_name = img.name
+            sample_row = layout.row()
+            sample_row.scale_y = 1.6
+            sample_row.operator('macblend.sample_image_colors', text='Sample Chart', icon='IMPORT')
+
+        ui_state = context.scene.macblend_sampling_ui
+        layout.label(text='Sampled Images')
+        list_row = layout.row()
+        list_row.template_list(
+            'MB_UL_SampledImages',
+            '',
+            bpy.data,
+            'images',
+            ui_state,
+            'active_image_index',
+            rows=3,
+        )
+        delete_column = list_row.column(align=True)
+        delete_column.enabled = _selected_sample_image(context.scene) is not None
+        delete_column.operator('macblend.clear_sample_data', text='', icon='TRASH')
+
+        selected_image = _selected_sample_image(context.scene)
+        display_data = selected_image.mb_sample_data if selected_image is not None else ui_state
+        box = layout.box()
+        box.label(text='Sampled Values')
+        samples_col = box.column(align=True)
+        samples_col.enabled = selected_image is not None
+        for display_row in range(4):
+            ui_row = samples_col.row(align=True)
+            for col_idx in range(6):
+                sample_idx = display_row * 6 + col_idx
+                cell = ui_row.column(align=True)
+                cell.prop(display_data, MB_SAMPLE_PROPERTY_NAMES[sample_idx], text='')
 
 
 classes = (
     MB_ColorSample,
     MB_ChartPatchCenter,
     MB_ImageSampleData,
+    MB_SamplingUIState,
+    MB_UL_SampledImages,
     MB_GT_OverlaySquare,
     MB_GT_CornerCross,
     MB_GT_FlipArrow,
@@ -969,7 +1075,6 @@ classes = (
     MB_OT_FlipOverlayVertical,
     MB_OT_CenterOverlayChart,
     MB_OT_SampleImageColors,
-    MB_OT_SaveSampleData,
     MB_OT_ClearSampleData,
     MB_PT_ImageEditorSamplePanel,
 )
