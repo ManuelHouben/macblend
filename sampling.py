@@ -59,6 +59,13 @@ def _debug_logging_enabled(context):
     addon = context.preferences.addons.get(__package__)
     return bool(addon and getattr(addon.preferences, 'debug_logging', False))
 
+
+def _set_drag_cursor(window):
+    try:
+        window.cursor_modal_set('HAND_CLOSED')
+    except TypeError:
+        window.cursor_modal_set('HAND')
+
 # Logical Macbeth order is top-to-bottom, left-to-right, matching the chart layout
 # used by the color-reference arrays and by the Nuke tools.
 # ccmaster: canonical Macbeth patch ordering used as the ground truth for all chart logic.
@@ -700,7 +707,7 @@ class MB_OT_AdjustOverlayCorner(bpy.types.Operator):
         self.start_value = tuple(getattr(self.data, corner_name))
         self.start_mouse_coords = tuple(context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y))
 
-        context.window.cursor_modal_set('HAND_CLOSED')
+        _set_drag_cursor(context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
