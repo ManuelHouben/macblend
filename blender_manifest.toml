@@ -7,9 +7,18 @@ type = "add-on"
 maintainer = "Manuel Houben"
 version = "1.0.0"
 blender_version_min = "4.2.0"
-description = "Calculates a color matrix using a Macbeth chart."
-tags = ["Color", "Calibration", "Compositor", "Image Editor"]
+tags = ["Compositing", "Pipeline"]
 license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
 files = "Read bundled color-transform data and user-selected JSON files"
+
+[build]
+paths = [
+	"__init__.py",
+	"calibration.py",
+	"core.py",
+	"LICENSE",
+	"mmColorTarget_colorspace_transforms.json",
+	"sampling.py",
+]

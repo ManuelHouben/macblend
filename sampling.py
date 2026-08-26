@@ -22,6 +22,12 @@ MB_MSGBUS_OWNER = object()
 MB_OVERLAY_RENDER_ALPHA_MAX = 0.999
 MB_FLIP_BUTTON_SCALE = 48.0
 MB_FLIP_BUTTON_LINE_WIDTH = 10
+MB_CORNER_CROSS_OUTLINE_COLOR = (0.45, 0.32, 0.02)
+MB_CORNER_CROSS_CORE_COLOR = (1.0, 1.0, 1.0)
+MB_CORNER_CROSS_CORE_LENGTH = 25.0
+MB_CORNER_CROSS_CORE_WIDTH = 3.0
+MB_CORNER_CROSS_OUTLINE_WIDTH = 2.0
+MB_CORNER_CROSS_SCALE = MB_CORNER_CROSS_CORE_LENGTH + (2.0 * MB_CORNER_CROSS_OUTLINE_WIDTH)
 MB_CHART_ASPECT_RATIO = 28.0 / 21.0
 MB_CHART_AREA_FRACTION = 0.25
 
@@ -142,22 +148,18 @@ def _set_sample_patch_value(data, sample_idx, rgb_value):
         setattr(data, MB_SAMPLE_PROPERTY_NAMES[sample_idx], tuple(rgb_value))
 
 
-def _ccmaster_patch_uv(slot, flip_horizontal=False, flip_vertical=False):
+def _ccmaster_patch_uv(slot):
     row = slot // 6
     col = slot % 6
     u = (col + 0.5) / 6.0
     v = 1.0 - (row + 0.5) / 4.0
-    if flip_horizontal:
-        u = 1.0 - u
-    if flip_vertical:
-        v = 1.0 - v
     return u, v
 
 
 def _build_ccmaster_patch_centers(data, corners):
     data.patch_centers.clear()
     for slot, patch_name in MB_CCMASTER:
-        u, v = _ccmaster_patch_uv(slot, bool(data.chart_hflip), bool(data.chart_vflip))
+        u, v = _ccmaster_patch_uv(slot)
         center_x, center_y = _grid_point(corners, u, v)
         patch = data.patch_centers.add()
         patch.slot = slot
@@ -262,6 +264,19 @@ def MB_Messagebus_Remove():
     bpy.msgbus.clear_by_owner(MB_MSGBUS_OWNER)
 
 
+def _cross_triangles(length, width):
+    half_length = length / (2.0 * MB_CORNER_CROSS_SCALE)
+    half_width = width / (2.0 * MB_CORNER_CROSS_SCALE)
+    return (
+        (-half_length, -half_width), (half_length, -half_width), (half_length, half_width),
+        (-half_length, -half_width), (half_length, half_width), (-half_length, half_width),
+        (-half_width, half_width), (half_width, half_width), (half_width, half_length),
+        (-half_width, half_width), (half_width, half_length), (-half_width, half_length),
+        (-half_width, -half_length), (half_width, -half_length), (half_width, -half_width),
+        (-half_width, -half_length), (half_width, -half_width), (-half_width, -half_width),
+    )
+
+
 class MB_GT_OverlaySquare(bpy.types.Gizmo):
     style: IntProperty(default=0, options={'SKIP_SAVE'})
 
@@ -292,22 +307,26 @@ class MB_GT_OverlaySquare(bpy.types.Gizmo):
 
 class MB_GT_CornerCross(bpy.types.Gizmo):
     def setup(self):
-        self.shape = self.new_custom_shape(
-            'LINES',
-            (
-                (-0.5, 0.0), (0.5, 0.0),
-                (0.0, -0.5), (0.0, 0.5),
+        self.outline_shape = self.new_custom_shape(
+            'TRIS',
+            _cross_triangles(
+                MB_CORNER_CROSS_CORE_LENGTH + (2.0 * MB_CORNER_CROSS_OUTLINE_WIDTH),
+                MB_CORNER_CROSS_CORE_WIDTH + (2.0 * MB_CORNER_CROSS_OUTLINE_WIDTH),
             ),
+        )
+        self.foreground_shape = self.new_custom_shape(
+            'TRIS',
+            _cross_triangles(MB_CORNER_CROSS_CORE_LENGTH, MB_CORNER_CROSS_CORE_WIDTH),
         )
 
     def draw(self, context):
-        if getattr(self, 'is_modal', False):
-            self.color = (1.0, 1.0, 1.0)
-            self.alpha = 1.0
-        else:
-            self.color = self.color_highlight if getattr(self, 'is_highlight', False) else (0.75, 0.75, 0.75)
-            self.alpha = self.alpha_highlight if getattr(self, 'is_highlight', False) else 0.9
-        self.draw_custom_shape(self.shape)
+        self.color = MB_CORNER_CROSS_OUTLINE_COLOR
+        self.alpha = 1.0
+        self.draw_custom_shape(self.outline_shape)
+
+        self.color = MB_CORNER_CROSS_CORE_COLOR
+        self.alpha = 1.0
+        self.draw_custom_shape(self.foreground_shape)
 
     def test_select(self, context, co):
         corners = [
@@ -403,7 +422,6 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
             corner.color_highlight = (0.35, 0.35, 0.35)
             corner.alpha = 0.9
             corner.alpha_highlight = 1.0
-            corner.line_width = 3
             corner.use_draw_modal = True
             operator = corner.target_set_operator('macblend.adjust_overlay_corner')
             operator.corner_idx = corner_idx
@@ -457,8 +475,8 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
 
         gizmo.hide = False
         gizmo.matrix_basis.identity()
-        gizmo.matrix_basis[0][0] = 14.0
-        gizmo.matrix_basis[1][1] = 14.0
+        gizmo.matrix_basis[0][0] = MB_CORNER_CROSS_SCALE
+        gizmo.matrix_basis[1][1] = MB_CORNER_CROSS_SCALE
         gizmo.matrix_basis[0][3] = region_point[0]
         gizmo.matrix_basis[1][3] = region_point[1]
 
@@ -529,11 +547,7 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
             if 0 <= int(sample.patch_index) < len(MB_CCMASTER)
         }
         for index in range(len(MB_CCMASTER)):
-            u, v = _ccmaster_patch_uv(
-                index,
-                bool(image.mb_sample_data.chart_hflip),
-                bool(image.mb_sample_data.chart_vflip),
-            )
+            u, v = _ccmaster_patch_uv(index)
             center = _grid_point(corners, u, v)
             cell_points = (
                 (center[0] - half_width, center[1] - half_height),
@@ -577,6 +591,14 @@ class MB_OT_AdjustOverlayCorner(bpy.types.Operator):
     bl_options = {'GRAB_CURSOR', 'BLOCKING', 'UNDO'}
 
     corner_idx: IntProperty(default=0, options={'SKIP_SAVE'})
+
+    @classmethod
+    def description(cls, context, properties):
+        corner_labels = ('Top Left', 'Top Right', 'Bottom Right', 'Bottom Left')
+        corner_idx = int(getattr(properties, 'corner_idx', -1))
+        if 0 <= corner_idx < len(corner_labels):
+            return f"Adjust the {corner_labels[corner_idx]} corner of the Macbeth chart overlay"
+        return cls.bl_label
 
     def invoke(self, context, event):
         image = getattr(context.space_data, 'image', None) or MB_TEMP.current_image
@@ -636,7 +658,14 @@ class MB_OT_FlipOverlayHorizontal(bpy.types.Operator):
             return {'CANCELLED'}
 
         data = image.mb_sample_data
-        data.chart_hflip = not data.chart_hflip
+        corner_tl = tuple(data.corner_tl)
+        corner_tr = tuple(data.corner_tr)
+        corner_br = tuple(data.corner_br)
+        corner_bl = tuple(data.corner_bl)
+        data.corner_tl = corner_tr
+        data.corner_tr = corner_tl
+        data.corner_br = corner_bl
+        data.corner_bl = corner_br
 
         _tag_image_editor_redraw()
         return {'FINISHED'}
@@ -655,7 +684,14 @@ class MB_OT_FlipOverlayVertical(bpy.types.Operator):
             return {'CANCELLED'}
 
         data = image.mb_sample_data
-        data.chart_vflip = not data.chart_vflip
+        corner_tl = tuple(data.corner_tl)
+        corner_tr = tuple(data.corner_tr)
+        corner_br = tuple(data.corner_br)
+        corner_bl = tuple(data.corner_bl)
+        data.corner_tl = corner_bl
+        data.corner_tr = corner_br
+        data.corner_br = corner_tr
+        data.corner_bl = corner_tl
 
         _tag_image_editor_redraw()
         return {'FINISHED'}
@@ -725,8 +761,6 @@ class MB_ImageSampleData(bpy.types.PropertyGroup):
     source_name: StringProperty(name="Source Name", default="")
     show_overlay: BoolProperty(name="Show Overlay", default=True)
     show_overlay_corners: BoolProperty(name="Overlay Corners", default=False)
-    chart_hflip: BoolProperty(name="Horizontal Flip", default=False)
-    chart_vflip: BoolProperty(name="Vertical Flip", default=False)
     corner_tl: FloatVectorProperty(name="Top Left", size=2, default=(0.25, 0.82))
     corner_tr: FloatVectorProperty(name="Top Right", size=2, default=(0.75, 0.82))
     corner_br: FloatVectorProperty(name="Bottom Right", size=2, default=(0.75, 0.18))
@@ -772,7 +806,7 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
         overlay_corners = _get_overlay_corners(data, image)
         debug_logging = _debug_logging_enabled(context)
         if debug_logging:
-            print(f"[MacBlend] User overlay state: h={bool(data.chart_hflip)} v={bool(data.chart_vflip)}", flush=True)
+            print(f"[MacBlend] User overlay corners: {overlay_corners}", flush=True)
         _build_ccmaster_patch_centers(data, overlay_corners)
         sample_size = max(1, min(int(data.patch_size), max(width, height)))
         if debug_logging:
@@ -889,8 +923,8 @@ class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
             box.prop(data, 'corner_br', text='Bottom Right')
             box.prop(data, 'corner_bl', text='Bottom Left')
             flip_row = box.row(align=True)
-            flip_row.operator('macblend.flip_overlay_horizontal', text='Flip Horizontal', depress=data.chart_hflip)
-            flip_row.operator('macblend.flip_overlay_vertical', text='Flip Vertical', depress=data.chart_vflip)
+            flip_row.operator('macblend.flip_overlay_horizontal', text='Flip Horizontal')
+            flip_row.operator('macblend.flip_overlay_vertical', text='Flip Vertical')
             center_row = box.row(align=True)
             center_row.enabled = not data.is_saved
             center_row.operator('macblend.center_overlay_chart', text='Center Overlay')
