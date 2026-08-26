@@ -73,9 +73,13 @@ def calculate_matrix(input_samples, ref_samples):
     if np.any(np.isnan(ref_samples)) or np.any(np.isinf(ref_samples)):
         print("      Err: Reference samples contain NaN or Inf values.")
         return None
+    if not np.any(input_samples) or not np.any(ref_samples):
+        print("      Err: Input or reference samples are all zeros.")
+        return None
     try:
-        # Let numpy determine the rcond value for best precision
-        result_x, residuals, rank, s = np.linalg.lstsq(input_samples, ref_samples, rcond=None)
+        # Match the Nuke tools' legacy least-squares behavior: solve A x = B and
+        # transpose the result before flattening / storing it.
+        result_x, residuals, rank, s = np.linalg.lstsq(input_samples, ref_samples, rcond=-1)
         matrix_calculated = result_x
         print(f"        lstsq rank: {rank}, residuals: {residuals}")
         print("        Raw lstsq matrix:")
@@ -90,7 +94,6 @@ def calculate_matrix(input_samples, ref_samples):
     if matrix_calculated.shape != (3, 3):
         print(f"      Err: Resulting matrix shape is incorrect: {matrix_calculated.shape}")
         return None
-    # Legacy CalibrateMacbeth.nk behavior transposes the raw lstsq result before flattening/storing it.
     matrix_final = matrix_calculated.T
     print("        Nuke-style transposed matrix:")
     for row in matrix_final:

@@ -19,7 +19,6 @@ class MB_TempData:
 
 MB_TEMP = MB_TempData()
 MB_MSGBUS_OWNER = object()
-MB_CORNER_TARGET_INSET = 0.01
 MB_OVERLAY_RENDER_ALPHA_MAX = 0.999
 MB_FLIP_BUTTON_SCALE = 48.0
 MB_FLIP_BUTTON_LINE_WIDTH = 10
@@ -53,33 +52,36 @@ MB_MACBETH_REFERENCE_SRGB = (
     (49 / 255.0, 49 / 255.0, 51 / 255.0),
 )
 
-# Internal order is bottom-to-top, left-to-right (matching current sampling order).
+# Logical Macbeth order is top-to-bottom, left-to-right, matching the chart layout
+# used by the color-reference arrays and by the Nuke tools.
+# ccmaster: canonical Macbeth patch ordering used as the ground truth for all chart logic.
 MB_MACBETH_PATCH_NAMES = (
-    'White 9.5',
-    'Neutral 8',
-    'Neutral 6.5',
-    'Neutral 5',
-    'Neutral 3.5',
-    'Black 2',
-    'Blue',
-    'Green',
-    'Red',
-    'Yellow',
-    'Magenta',
-    'Cyan',
-    'Orange',
-    'Purplish Blue',
-    'Moderate Red',
-    'Purple',
-    'Yellow Green',
-    'Orange Yellow',
     'Dark Skin',
     'Light Skin',
     'Blue Sky',
     'Foliage',
     'Blue Flower',
     'Bluish Green',
+    'Orange',
+    'Purplish Blue',
+    'Moderate Red',
+    'Purple',
+    'Yellow Green',
+    'Orange Yellow',
+    'Blue',
+    'Green',
+    'Red',
+    'Yellow',
+    'Magenta',
+    'Cyan',
+    'White 9.5',
+    'Neutral 8',
+    'Neutral 6.5',
+    'Neutral 5',
+    'Neutral 3.5',
+    'Black 2',
 )
+MB_CCMASTER = tuple((slot, name) for slot, name in enumerate(MB_MACBETH_PATCH_NAMES))
 
 MB_SAMPLE_PROPERTY_NAMES = tuple(f"sample_patch_{index + 1:02d}" for index in range(24))
 
@@ -106,27 +108,8 @@ def _get_overlay_corners(data, image):
     )
 
 
-def _corner_target_point(corners, corner_idx, inset=MB_CORNER_TARGET_INSET):
-    tl, tr, br, bl = corners
-    if corner_idx == 0:
-        return (
-            tl[0] + (tr[0] - tl[0]) * inset + (bl[0] - tl[0]) * inset,
-            tl[1] + (tr[1] - tl[1]) * inset + (bl[1] - tl[1]) * inset,
-        )
-    if corner_idx == 1:
-        return (
-            tr[0] + (tl[0] - tr[0]) * inset + (br[0] - tr[0]) * inset,
-            tr[1] + (tl[1] - tr[1]) * inset + (br[1] - tr[1]) * inset,
-        )
-    if corner_idx == 2:
-        return (
-            br[0] + (tr[0] - br[0]) * inset + (bl[0] - br[0]) * inset,
-            br[1] + (tr[1] - br[1]) * inset + (bl[1] - br[1]) * inset,
-        )
-    return (
-        bl[0] + (tl[0] - bl[0]) * inset + (br[0] - bl[0]) * inset,
-        bl[1] + (tl[1] - bl[1]) * inset + (br[1] - bl[1]) * inset,
-    )
+def _corner_target_point(corners, corner_idx):
+    return corners[corner_idx]
 
 
 def _region_point(context, point):
@@ -154,27 +137,30 @@ def _set_sample_patch_value(data, sample_idx, rgb_value):
         setattr(data, MB_SAMPLE_PROPERTY_NAMES[sample_idx], tuple(rgb_value))
 
 
-def _overlay_flip_state(corners):
-    # Determine whether the local overlay axes are mirrored in image space.
-    du = (
-        _grid_point(corners, 1.0, 0.5)[0] - _grid_point(corners, 0.0, 0.5)[0],
-        _grid_point(corners, 1.0, 0.5)[1] - _grid_point(corners, 0.0, 0.5)[1],
-    )
-    dv = (
-        _grid_point(corners, 0.5, 1.0)[0] - _grid_point(corners, 0.5, 0.0)[0],
-        _grid_point(corners, 0.5, 1.0)[1] - _grid_point(corners, 0.5, 0.0)[1],
-    )
-    return du[0] < 0.0, dv[1] < 0.0
-
-
-def _remap_sample_index(sample_idx, flip_horizontal, flip_vertical):
-    row = sample_idx // 6
-    col = sample_idx % 6
+def _ccmaster_patch_uv(slot, flip_horizontal=False, flip_vertical=False):
+    row = slot // 6
+    col = slot % 6
+    u = (col + 0.5) / 6.0
+    v = 1.0 - (row + 0.5) / 4.0
     if flip_horizontal:
-        col = 5 - col
+        u = 1.0 - u
     if flip_vertical:
-        row = 3 - row
-    return row * 6 + col
+        v = 1.0 - v
+    return u, v
+
+
+def _build_ccmaster_patch_centers(data, corners):
+    data.patch_centers.clear()
+    for slot, patch_name in MB_CCMASTER:
+        u, v = _ccmaster_patch_uv(slot, bool(data.chart_hflip), bool(data.chart_vflip))
+        center_x, center_y = _grid_point(corners, u, v)
+        patch = data.patch_centers.add()
+        patch.slot = slot
+        patch.patch_name = patch_name
+        patch.x = center_x
+        patch.y = center_y
+
+    return data.patch_centers
 
 
 def _center_overlay_corners(data, image_width, image_height, chart_aspect_ratio=MB_CHART_ASPECT_RATIO, area_fraction=MB_CHART_AREA_FRACTION):
@@ -532,33 +518,37 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
         half_width = (patch_size * 0.5) / width
         half_height = (patch_size * 0.5) / height
 
-        for row in range(4):
-            v0 = row / 4.0
-            v1 = (row + 1) / 4.0
-            for col in range(6):
-                u0 = col / 6.0
-                u1 = (col + 1) / 6.0
-                index = row * 6 + col
-                center = _grid_point(corners, (u0 + u1) * 0.5, (v0 + v1) * 0.5)
-                cell_points = (
-                    (center[0] - half_width, center[1] - half_height),
-                    (center[0] + half_width, center[1] - half_height),
-                    (center[0] + half_width, center[1] + half_height),
-                    (center[0] - half_width, center[1] + half_height),
-                )
+        samples_by_slot = {
+            int(sample.patch_index): sample
+            for sample in image.mb_sample_data.samples
+            if 0 <= int(sample.patch_index) < len(MB_CCMASTER)
+        }
+        for index in range(len(MB_CCMASTER)):
+            u, v = _ccmaster_patch_uv(
+                index,
+                bool(image.mb_sample_data.chart_hflip),
+                bool(image.mb_sample_data.chart_vflip),
+            )
+            center = _grid_point(corners, u, v)
+            cell_points = (
+                (center[0] - half_width, center[1] - half_height),
+                (center[0] + half_width, center[1] - half_height),
+                (center[0] + half_width, center[1] + half_height),
+                (center[0] - half_width, center[1] + half_height),
+            )
 
-                self._set_box(self.outlines[index], context, cell_points)
-                self._set_box(self.fills[index], context, cell_points)
+            self._set_box(self.outlines[index], context, cell_points)
+            self._set_box(self.fills[index], context, cell_points)
 
-                if len(image.mb_sample_data.samples) > index:
-                    patch_color = image.mb_sample_data.samples[index].rgb
-                    patch_color = _linear_to_srgb(patch_color)
-                    self.fills[index].color = self.fills[index].color_highlight = patch_color
-                else:
-                    self.fills[index].color = self.fills[index].color_highlight = MB_MACBETH_REFERENCE_SRGB[index]
-                self.fills[index].alpha = self.fills[index].alpha_highlight = overlay_alpha
+            if index in samples_by_slot:
+                patch_color = samples_by_slot[index].rgb
+                patch_color = _linear_to_srgb(patch_color)
+                self.fills[index].color = self.fills[index].color_highlight = patch_color
+            else:
+                self.fills[index].color = self.fills[index].color_highlight = MB_MACBETH_REFERENCE_SRGB[index]
+            self.fills[index].alpha = self.fills[index].alpha_highlight = overlay_alpha
 
-        for corner_idx, corner_name in enumerate(('corner_tl', 'corner_tr', 'corner_br', 'corner_bl')):
+        for corner_idx in range(4):
             corner_gizmo = self.corners[corner_idx]
             corner_point = _corner_target_point(corners, corner_idx)
             self._set_cross(corner_gizmo, context, corner_point)
@@ -630,7 +620,7 @@ class MB_OT_AdjustOverlayCorner(bpy.types.Operator):
 class MB_OT_FlipOverlayHorizontal(bpy.types.Operator):
     bl_idname = 'macblend.flip_overlay_horizontal'
     bl_label = 'Flip Overlay Horizontal'
-    bl_description = 'Swap left and right overlay corner alignment crosshairs'
+    bl_description = 'Mirror the Macbeth patch orientation horizontally inside the aligned corners'
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -640,15 +630,7 @@ class MB_OT_FlipOverlayHorizontal(bpy.types.Operator):
             return {'CANCELLED'}
 
         data = image.mb_sample_data
-        tl = tuple(data.corner_tl)
-        tr = tuple(data.corner_tr)
-        br = tuple(data.corner_br)
-        bl = tuple(data.corner_bl)
-
-        data.corner_tl = tr
-        data.corner_tr = tl
-        data.corner_bl = br
-        data.corner_br = bl
+        data.chart_hflip = not data.chart_hflip
 
         _tag_image_editor_redraw()
         return {'FINISHED'}
@@ -657,7 +639,7 @@ class MB_OT_FlipOverlayHorizontal(bpy.types.Operator):
 class MB_OT_FlipOverlayVertical(bpy.types.Operator):
     bl_idname = 'macblend.flip_overlay_vertical'
     bl_label = 'Flip Overlay Vertical'
-    bl_description = 'Swap top and bottom overlay corner alignment crosshairs'
+    bl_description = 'Mirror the Macbeth patch orientation vertically inside the aligned corners'
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -667,15 +649,7 @@ class MB_OT_FlipOverlayVertical(bpy.types.Operator):
             return {'CANCELLED'}
 
         data = image.mb_sample_data
-        tl = tuple(data.corner_tl)
-        tr = tuple(data.corner_tr)
-        br = tuple(data.corner_br)
-        bl = tuple(data.corner_bl)
-
-        data.corner_tl = bl
-        data.corner_bl = tl
-        data.corner_tr = br
-        data.corner_br = tr
+        data.chart_vflip = not data.chart_vflip
 
         _tag_image_editor_redraw()
         return {'FINISHED'}
@@ -711,6 +685,13 @@ def MB_Messagebus_LoadPost(*args):
 
 
 class MB_ColorSample(bpy.types.PropertyGroup):
+    patch_index: IntProperty(
+        name="Patch Index",
+        description="Logical Macbeth patch slot this sample belongs to",
+        default=-1,
+        min=-1,
+        max=23,
+    )
     rgb: FloatVectorProperty(
         name="RGB",
         description="Sampled Macbeth patch value",
@@ -720,8 +701,16 @@ class MB_ColorSample(bpy.types.PropertyGroup):
     )
 
 
+class MB_ChartPatchCenter(bpy.types.PropertyGroup):
+    slot: IntProperty(name="Slot", default=-1, min=-1, max=23)
+    patch_name: StringProperty(name="Patch Name", default="")
+    x: FloatProperty(name="X", default=0.0)
+    y: FloatProperty(name="Y", default=0.0)
+
+
 class MB_ImageSampleData(bpy.types.PropertyGroup):
     samples: CollectionProperty(type=MB_ColorSample)
+    patch_centers: CollectionProperty(type=MB_ChartPatchCenter)
     has_preview: BoolProperty(name="Preview Available", default=False)
     is_saved: BoolProperty(name="Saved in Blend", default=False)
     overlay_defaults_initialized: BoolProperty(name="Overlay Defaults Initialized", default=False)
@@ -730,6 +719,8 @@ class MB_ImageSampleData(bpy.types.PropertyGroup):
     source_name: StringProperty(name="Source Name", default="")
     show_overlay: BoolProperty(name="Show Overlay", default=True)
     show_overlay_corners: BoolProperty(name="Overlay Corners", default=False)
+    chart_hflip: BoolProperty(name="Horizontal Flip", default=False)
+    chart_vflip: BoolProperty(name="Vertical Flip", default=False)
     corner_tl: FloatVectorProperty(name="Top Left", size=2, default=(0.25, 0.82))
     corner_tr: FloatVectorProperty(name="Top Right", size=2, default=(0.75, 0.82))
     corner_br: FloatVectorProperty(name="Bottom Right", size=2, default=(0.75, 0.18))
@@ -763,6 +754,7 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
 
         data = image.mb_sample_data
         data.samples.clear()
+        data.patch_centers.clear()
         _reset_sample_patch_values(data)
 
         width, height = image.size
@@ -772,22 +764,23 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
 
         pixels = np.asarray(image.pixels, dtype=np.float32).reshape((height, width, image.channels))
         overlay_corners = _get_overlay_corners(data, image)
-        flip_horizontal, flip_vertical = _overlay_flip_state(overlay_corners)
+        print(f"[MacBlend] User overlay state: h={bool(data.chart_hflip)} v={bool(data.chart_vflip)}", flush=True)
+        _build_ccmaster_patch_centers(data, overlay_corners)
         sample_size = max(1, min(int(data.patch_size), max(width, height)))
+        print("[MacBlend] Sample Chart debug:", flush=True)
 
-        for row in range(4):
-            for col in range(6):
-                u = (col + 0.5) / 6.0
-                v = (row + 0.5) / 4.0
-                center_x, center_y = _grid_point(overlay_corners, u, v)
-                x = max(0, min(width - 1, int(round(center_x * width))))
-                y = max(0, min(height - 1, int(round(center_y * height))))
+        for patch in data.patch_centers:
+            slot = int(patch.slot)
+            patch_name = patch.patch_name or MB_MACBETH_PATCH_NAMES[slot] if slot < len(MB_MACBETH_PATCH_NAMES) else f"slot_{slot}"
+            x = max(0, min(width - 1, int(round(float(patch.x) * width))))
+            y = max(0, min(height - 1, int(round(float(patch.y) * height))))
 
-                sample = data.samples.add()
-                sample.rgb = sample_image_color(pixels, width, height, x, y, sample_size)
-                sampled_idx = row * 6 + col
-                patch_idx = _remap_sample_index(sampled_idx, flip_horizontal, flip_vertical)
-                _set_sample_patch_value(data, patch_idx, sample.rgb)
+            sample_rgb = sample_image_color(pixels, width, height, x, y, sample_size)
+            sample = data.samples.add()
+            sample.patch_index = slot
+            sample.rgb = sample_rgb
+            _set_sample_patch_value(data, slot, sample.rgb)
+            print(f"  slot[{slot}] {patch_name} -> {tuple(float(v) for v in sample_rgb)}", flush=True)
 
         data.has_preview = True
         data.is_saved = False
@@ -814,6 +807,10 @@ class MB_OT_SaveSampleData(bpy.types.Operator):
 
         data.is_saved = True
         data.source_name = image.name
+        data.corner_tl = tuple(data.corner_tl)
+        data.corner_tr = tuple(data.corner_tr)
+        data.corner_br = tuple(data.corner_br)
+        data.corner_bl = tuple(data.corner_bl)
         if data.show_overlay:
             data.show_overlay = False
             data.show_overlay_corners = False
@@ -881,8 +878,8 @@ class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
             box.prop(data, 'corner_br', text='Bottom Right')
             box.prop(data, 'corner_bl', text='Bottom Left')
             flip_row = box.row(align=True)
-            flip_row.operator('macblend.flip_overlay_horizontal', text='Flip Horizontal')
-            flip_row.operator('macblend.flip_overlay_vertical', text='Flip Vertical')
+            flip_row.operator('macblend.flip_overlay_horizontal', text='Flip Horizontal', depress=data.chart_hflip)
+            flip_row.operator('macblend.flip_overlay_vertical', text='Flip Vertical', depress=data.chart_vflip)
             center_row = box.row(align=True)
             center_row.enabled = not data.is_saved
             center_row.operator('macblend.center_overlay_chart', text='Center Overlay')
@@ -899,9 +896,8 @@ class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
             samples_col = box.column(align=True)
             for display_row in range(4):
                 ui_row = samples_col.row(align=True)
-                source_row = 3 - display_row
                 for col_idx in range(6):
-                    sample_idx = source_row * 6 + col_idx
+                    sample_idx = display_row * 6 + col_idx
                     cell = ui_row.column(align=True)
                     cell.prop(data, MB_SAMPLE_PROPERTY_NAMES[sample_idx], text='')
 
@@ -917,6 +913,7 @@ class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
 
 classes = (
     MB_ColorSample,
+    MB_ChartPatchCenter,
     MB_ImageSampleData,
     MB_GT_OverlaySquare,
     MB_GT_CornerCross,
