@@ -524,13 +524,19 @@ class MB_OT_MatchTransform(bpy.types.Operator):
         if settings is None:
             return {'CANCELLED'}
 
-        forward_name = _mode_node_name(settings.node_name, 'Match')
-        forward_node = _create_matrix_node(tree, editor_kind, settings, forward_name, matrix_3x3, label_text='Forward', location=(300, 150))
+        try:
+            match_matrix = np.linalg.inv(matrix_3x3)
+        except np.linalg.LinAlgError:
+            match_matrix = np.eye(3, dtype=np.float32)
+
+        match_name = _mode_node_name(settings.node_name, 'Match')
+        match_node = _create_matrix_node(tree, editor_kind, settings, match_name, match_matrix, label_text='Inverse', location=(300, 150))
 
         if settings.create_exposure_node:
-            _create_exposure_node(tree, editor_kind, forward_node, settings.normalization_factor, label_text='Forward Exposure')
+            match_factor = 1.0 / max(float(settings.normalization_factor), 1e-8)
+            _create_exposure_node(tree, editor_kind, match_node, match_factor, label_text='Inverse Exposure')
 
-        self.report({'INFO'}, f"Created forward matrix '{forward_name}' with optional exposure scaling.")
+        self.report({'INFO'}, f"Created inverse matrix '{match_name}' with optional exposure scaling.")
         return {'FINISHED'}
 
 
@@ -544,19 +550,13 @@ class MB_OT_NeutralizeTransform(bpy.types.Operator):
         if settings is None:
             return {'CANCELLED'}
 
-        try:
-            inv_matrix = np.linalg.inv(matrix_3x3)
-        except np.linalg.LinAlgError:
-            inv_matrix = np.eye(3, dtype=np.float32)
-
-        inverse_name = _mode_node_name(settings.node_name, 'Neutralize')
-        inverse_node = _create_matrix_node(tree, editor_kind, settings, inverse_name, inv_matrix, label_text='Inverse', location=(300, -150))
+        neutralize_name = _mode_node_name(settings.node_name, 'Neutralize')
+        neutralize_node = _create_matrix_node(tree, editor_kind, settings, neutralize_name, matrix_3x3, label_text='Forward', location=(300, -150))
 
         if settings.create_exposure_node:
-            inverse_factor = 1.0 / max(float(settings.normalization_factor), 1e-8)
-            _create_exposure_node(tree, editor_kind, inverse_node, inverse_factor, label_text='Inverse Exposure')
+            _create_exposure_node(tree, editor_kind, neutralize_node, settings.normalization_factor, label_text='Forward Exposure')
 
-        self.report({'INFO'}, f"Created inverse matrix '{inverse_name}' with optional exposure scaling.")
+        self.report({'INFO'}, f"Created forward matrix '{neutralize_name}' with optional exposure scaling.")
         return {'FINISHED'}
 
 

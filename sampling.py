@@ -539,6 +539,7 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
 
             self._set_box(self.outlines[index], context, cell_points)
             self._set_box(self.fills[index], context, cell_points)
+            self.outlines[index].color = self.outlines[index].color_highlight = MB_MACBETH_REFERENCE_SRGB[index]
 
             if index in samples_by_slot:
                 patch_color = samples_by_slot[index].rgb
@@ -784,6 +785,7 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
 
         data.has_preview = True
         data.is_saved = False
+        _tag_image_editor_redraw()
         self.report({'INFO'}, f"Sampled {len(data.samples)} values from '{image.name}'.")
         return {'FINISHED'}
 
