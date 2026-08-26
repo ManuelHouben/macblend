@@ -334,193 +334,198 @@ def build_matrix_node_group(tree_type):
     return group
 
 
+def _prepare_calibration_data(self, context):
+    settings = getattr(context.scene, 'macblend_calibrator_settings', None)
+    if settings is None:
+        settings = getattr(context.scene, 'macbeth_calibrator_settings', None)
+    if settings is None:
+        return None, None, None
+
+    image = settings.sample_source_image
+    if image is None or not getattr(image, 'mb_sample_data', None):
+        self.report({'ERROR'}, "No valid saved source image selected.")
+        return None, None, None
+
+    data = image.mb_sample_data
+    if not data.is_saved or len(data.samples) == 0:
+        self.report({'ERROR'}, "The selected image has no saved Macbeth data.")
+        return None, None, None
+
+    editor_kind = _get_editor_kind(getattr(context, 'space_data', None))
+    if editor_kind is None:
+        self.report({'ERROR'}, "This operator only works in Shader or Compositor Node Editor.")
+        return None, None, None
+
+    tree = getattr(context.space_data, 'edit_tree', None)
+    if tree is None:
+        self.report({'ERROR'}, "This panel only works in the Shader or Compositor editor.")
+        return None, None, None
+
+    source_samples = np.array([sample.rgb for sample in data.samples], dtype=np.float32)
+    if source_samples.shape != (24, 3):
+        self.report({'ERROR'}, "The image samples do not form a complete 24-patch Macbeth set.")
+        return None, None, None
+
+    selected_target = settings.target_colorspace or "LINEAR_SRGB_D65"
+    try:
+        ref = _build_reference_samples(context, selected_target)
+    except ValueError as exc:
+        self.report({'ERROR'}, str(exc))
+        return None, None, None
+
+    normalization_factor = 1.0
+    matrix_input = source_samples
+
+    if settings.create_exposure_node:
+        neutral_idx = 21
+        if neutral_idx >= len(source_samples) or neutral_idx >= len(ref):
+            self.report({'ERROR'}, "Neutral patch index is out of bounds for normalization.")
+            return None, None, None
+
+        src_grey = source_samples[neutral_idx]
+        ref_grey = ref[neutral_idx]
+        src_luma = float(np.dot(src_grey, core.LUMA_COEFFS_REC709))
+        ref_luma = float(np.dot(ref_grey, core.LUMA_COEFFS_REC709))
+
+        if src_luma > 1e-7:
+            normalization_factor = ref_luma / src_luma
+            matrix_input = source_samples * normalization_factor
+        else:
+            normalization_factor = 1.0
+
+    matrix_3x3 = core.calculate_matrix(matrix_input, ref)
+    if matrix_3x3 is None:
+        self.report({'ERROR'}, "Matrix calculation failed.")
+        return None, None, None
+
+    matrix_3x3 = np.asarray(matrix_3x3, dtype=np.float32)
+    settings.calculated_matrix = matrix_3x3.flatten()
+    settings.calculation_done = True
+    settings.normalization_factor = float(normalization_factor)
+    settings.matrix_display_string = (
+        f"[{matrix_3x3[0,0]:>9.6f} {matrix_3x3[0,1]:>9.6f} {matrix_3x3[0,2]:>9.6f}]\n"
+        f"[{matrix_3x3[1,0]:>9.6f} {matrix_3x3[1,1]:>9.6f} {matrix_3x3[1,2]:>9.6f}]\n"
+        f"[{matrix_3x3[2,0]:>9.6f} {matrix_3x3[2,1]:>9.6f} {matrix_3x3[2,2]:>9.6f}]"
+    )
+
+    return settings, editor_kind, tree, matrix_3x3, normalization_factor
+
+
+def _create_matrix_node(tree, editor_kind, settings, node_name, matrix_3x3, *, label_text, location):
+    group = build_matrix_node_group(editor_kind)
+    node = tree.nodes.get(node_name)
+    if node and node.bl_idname != 'ShaderNodeGroup' and node.bl_idname != 'CompositorNodeGroup':
+        tree.nodes.remove(node)
+        node = None
+    if node is None:
+        node = tree.nodes.new(type='ShaderNodeGroup' if editor_kind == 'SHADER' else 'CompositorNodeGroup')
+        node.name = node_name
+    node.node_tree = group
+    node.label = f"{node_name} ({label_text})"
+    node.location = location
+
+    row_values = [
+        (float(matrix_3x3[0, 0]), float(matrix_3x3[0, 1]), float(matrix_3x3[0, 2])),
+        (float(matrix_3x3[1, 0]), float(matrix_3x3[1, 1]), float(matrix_3x3[1, 2])),
+        (float(matrix_3x3[2, 0]), float(matrix_3x3[2, 1]), float(matrix_3x3[2, 2])),
+    ]
+
+    if 'Output Red' in node.inputs:
+        node.inputs['Output Red'].default_value = row_values[0]
+    if 'Output Green' in node.inputs:
+        node.inputs['Output Green'].default_value = row_values[1]
+    if 'Output Blue' in node.inputs:
+        node.inputs['Output Blue'].default_value = row_values[2]
+
+    return node
+
+
+def _mode_node_name(base_name, mode):
+    return f"{base_name}{mode}"
+
+
+def _create_exposure_node(tree, editor_kind, node, scale_value, *, label_text):
+    node_name = node.name
+    exp_name = f"{node_name}Exposure"
+    if editor_kind == 'COMPOSITOR':
+        exp_node = tree.nodes.get(exp_name)
+        if exp_node is None:
+            exp_node = tree.nodes.new(type='CompositorNodeExposure')
+            exp_node.name = exp_name
+        exp_node.label = exp_name
+        exp_node.location = (node.location[0] + 300, node.location[1])
+        exp_node.inputs[1].default_value = math.log2(max(float(scale_value), 1e-8))
+        if not node.outputs[0].is_linked or not exp_node.inputs[0].is_linked:
+            if exp_node.inputs[0].is_linked is False:
+                tree.links.new(node.outputs[0], exp_node.inputs[0])
+        return exp_node
+
+    exp_node = tree.nodes.get(exp_name)
+    if exp_node is None:
+        exp_node = tree.nodes.new(type='ShaderNodeVectorMath')
+        exp_node.name = exp_name
+    exp_node.label = exp_name
+    exp_node.location = (node.location[0] + 300, node.location[1])
+    _set_vector_math_scale_value(exp_node, scale_value)
+    if not node.outputs[0].is_linked or not exp_node.inputs[0].is_linked:
+        if exp_node.inputs[0].is_linked is False:
+            tree.links.new(node.outputs[0], exp_node.inputs[0])
+    return exp_node
+
+
+class MB_OT_MatchTransform(bpy.types.Operator):
+    bl_idname = "macblend.match_transform"
+    bl_label = "Match"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings, editor_kind, tree, matrix_3x3, normalization_factor = _prepare_calibration_data(self, context)
+        if settings is None:
+            return {'CANCELLED'}
+
+        forward_name = _mode_node_name(settings.node_name, 'Match')
+        forward_node = _create_matrix_node(tree, editor_kind, settings, forward_name, matrix_3x3, label_text='Forward', location=(300, 150))
+
+        if settings.create_exposure_node:
+            _create_exposure_node(tree, editor_kind, forward_node, settings.normalization_factor, label_text='Forward Exposure')
+
+        self.report({'INFO'}, f"Created forward matrix '{forward_name}' with optional exposure scaling.")
+        return {'FINISHED'}
+
+
+class MB_OT_NeutralizeTransform(bpy.types.Operator):
+    bl_idname = "macblend.neutralize_transform"
+    bl_label = "Neutralize"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings, editor_kind, tree, matrix_3x3, normalization_factor = _prepare_calibration_data(self, context)
+        if settings is None:
+            return {'CANCELLED'}
+
+        try:
+            inv_matrix = np.linalg.inv(matrix_3x3)
+        except np.linalg.LinAlgError:
+            inv_matrix = np.eye(3, dtype=np.float32)
+
+        inverse_name = _mode_node_name(settings.node_name, 'Neutralize')
+        inverse_node = _create_matrix_node(tree, editor_kind, settings, inverse_name, inv_matrix, label_text='Inverse', location=(300, -150))
+
+        if settings.create_exposure_node:
+            inverse_factor = 1.0 / max(float(settings.normalization_factor), 1e-8)
+            _create_exposure_node(tree, editor_kind, inverse_node, inverse_factor, label_text='Inverse Exposure')
+
+        self.report({'INFO'}, f"Created inverse matrix '{inverse_name}' with optional exposure scaling.")
+        return {'FINISHED'}
+
+
 class MB_OT_CreateTransform(bpy.types.Operator):
     bl_idname = "macblend.create_transform"
     bl_label = "Create Transform"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        settings = getattr(context.scene, 'macblend_calibrator_settings', None)
-        if settings is None:
-            settings = getattr(context.scene, 'macbeth_calibrator_settings', None)
-        image = settings.sample_source_image
-        if image is None or not getattr(image, 'mb_sample_data', None):
-            self.report({'ERROR'}, "No valid saved source image selected.")
-            return {'CANCELLED'}
-
-        data = image.mb_sample_data
-        if not data.is_saved or len(data.samples) == 0:
-            self.report({'ERROR'}, "The selected image has no saved Macbeth data.")
-            return {'CANCELLED'}
-
-        editor_kind = _get_editor_kind(getattr(context, 'space_data', None))
-        if editor_kind is None:
-            self.report({'ERROR'}, "This operator only works in Shader or Compositor Node Editor.")
-            return {'CANCELLED'}
-
-        tree = getattr(context.space_data, 'edit_tree', None)
-        if tree is None:
-            self.report({'ERROR'}, "This panel only works in the Shader or Compositor editor.")
-            return {'CANCELLED'}
-
-        source_samples = np.array([sample.rgb for sample in data.samples], dtype=np.float32)
-        if source_samples.shape != (24, 3):
-            self.report({'ERROR'}, "The image samples do not form a complete 24-patch Macbeth set.")
-            return {'CANCELLED'}
-
-        selected_target = settings.target_colorspace or "LINEAR_SRGB_D65"
-        try:
-            ref = _build_reference_samples(context, selected_target)
-        except ValueError as exc:
-            self.report({'ERROR'}, str(exc))
-            return {'CANCELLED'}
-
-        normalization_factor = 1.0
-        matrix_input = source_samples
-
-        if settings.create_exposure_node:
-            # Match legacy behavior: use the Neutral 5 patch for luminance normalization.
-            neutral_idx = 21
-            if neutral_idx >= len(source_samples) or neutral_idx >= len(ref):
-                self.report({'ERROR'}, "Neutral patch index is out of bounds for normalization.")
-                return {'CANCELLED'}
-
-            src_grey = source_samples[neutral_idx]
-            ref_grey = ref[neutral_idx]
-            src_luma = float(np.dot(src_grey, core.LUMA_COEFFS_REC709))
-            ref_luma = float(np.dot(ref_grey, core.LUMA_COEFFS_REC709))
-
-            if src_luma > 1e-7:
-                normalization_factor = ref_luma / src_luma
-                matrix_input = source_samples * normalization_factor
-            else:
-                normalization_factor = 1.0
-
-        matrix_3x3 = core.calculate_matrix(matrix_input, ref)
-        if matrix_3x3 is None:
-            self.report({'ERROR'}, "Matrix calculation failed.")
-            return {'CANCELLED'}
-
-        matrix_3x3 = np.asarray(matrix_3x3, dtype=np.float32)
-        settings.calculated_matrix = matrix_3x3.flatten()
-        settings.calculation_done = True
-        settings.normalization_factor = float(normalization_factor)
-        settings.matrix_display_string = (
-            f"[{matrix_3x3[0,0]:>9.6f} {matrix_3x3[0,1]:>9.6f} {matrix_3x3[0,2]:>9.6f}]\n"
-            f"[{matrix_3x3[1,0]:>9.6f} {matrix_3x3[1,1]:>9.6f} {matrix_3x3[1,2]:>9.6f}]\n"
-            f"[{matrix_3x3[2,0]:>9.6f} {matrix_3x3[2,1]:>9.6f} {matrix_3x3[2,2]:>9.6f}]"
-        )
-
-        group_name = "MB ColorMatrix (Shader)" if editor_kind == 'SHADER' else "MB ColorMatrix (Compositor)"
-        group = build_matrix_node_group(editor_kind)
-
-        forward_name = settings.node_name
-        inverse_name = f"{settings.node_name}_Inverse"
-
-        forward_node = tree.nodes.get(forward_name)
-        if forward_node and forward_node.bl_idname != 'ShaderNodeGroup' and forward_node.bl_idname != 'CompositorNodeGroup':
-            tree.nodes.remove(forward_node)
-            forward_node = None
-        if forward_node is None:
-            forward_node = tree.nodes.new(type='ShaderNodeGroup' if editor_kind == 'SHADER' else 'CompositorNodeGroup')
-            forward_node.name = forward_name
-            forward_node.location = (300, 150)
-        forward_node.node_tree = group
-        forward_node.label = f"{forward_name} (Forward)"
-
-        inverse_node = tree.nodes.get(inverse_name)
-        if inverse_node and inverse_node.bl_idname != 'ShaderNodeGroup' and inverse_node.bl_idname != 'CompositorNodeGroup':
-            tree.nodes.remove(inverse_node)
-            inverse_node = None
-        if inverse_node is None:
-            inverse_node = tree.nodes.new(type='ShaderNodeGroup' if editor_kind == 'SHADER' else 'CompositorNodeGroup')
-            inverse_node.name = inverse_name
-            inverse_node.location = (300, -150)
-        inverse_node.node_tree = group
-        inverse_node.label = f"{inverse_name} (Inverse)"
-
-        try:
-            inv_matrix = np.linalg.inv(matrix_3x3)
-        except np.linalg.LinAlgError:
-            inv_matrix = np.eye(3)
-
-        row_values = [
-            (float(matrix_3x3[0, 0]), float(matrix_3x3[0, 1]), float(matrix_3x3[0, 2])),
-            (float(matrix_3x3[1, 0]), float(matrix_3x3[1, 1]), float(matrix_3x3[1, 2])),
-            (float(matrix_3x3[2, 0]), float(matrix_3x3[2, 1]), float(matrix_3x3[2, 2])),
-        ]
-        inv_row_values = [
-            (float(inv_matrix[0, 0]), float(inv_matrix[0, 1]), float(inv_matrix[0, 2])),
-            (float(inv_matrix[1, 0]), float(inv_matrix[1, 1]), float(inv_matrix[1, 2])),
-            (float(inv_matrix[2, 0]), float(inv_matrix[2, 1]), float(inv_matrix[2, 2])),
-        ]
-
-        if 'Output Red' in forward_node.inputs:
-            forward_node.inputs['Output Red'].default_value = row_values[0]
-        if 'Output Green' in forward_node.inputs:
-            forward_node.inputs['Output Green'].default_value = row_values[1]
-        if 'Output Blue' in forward_node.inputs:
-            forward_node.inputs['Output Blue'].default_value = row_values[2]
-
-        if 'Output Red' in inverse_node.inputs:
-            inverse_node.inputs['Output Red'].default_value = inv_row_values[0]
-        if 'Output Green' in inverse_node.inputs:
-            inverse_node.inputs['Output Green'].default_value = inv_row_values[1]
-        if 'Output Blue' in inverse_node.inputs:
-            inverse_node.inputs['Output Blue'].default_value = inv_row_values[2]
-
-        if settings.create_exposure_node:
-            forward_exp_name = f"{forward_name}_Exposure"
-            inverse_exp_name = f"{inverse_name}_Exposure"
-            if editor_kind == 'COMPOSITOR':
-                forward_exp = tree.nodes.get(forward_exp_name)
-                if forward_exp is None:
-                    forward_exp = tree.nodes.new(type='CompositorNodeExposure')
-                    forward_exp.name = forward_exp_name
-                    forward_exp.location = (600, 180)
-                forward_exp.label = forward_exp_name
-                forward_exp.inputs[1].default_value = math.log2(max(float(settings.normalization_factor), 1e-8))
-                if not forward_node.outputs[0].is_linked or not forward_exp.inputs[0].is_linked:
-                    if forward_exp.inputs[0].is_linked is False:
-                        tree.links.new(forward_node.outputs[0], forward_exp.inputs[0])
-
-                inverse_exp = tree.nodes.get(inverse_exp_name)
-                if inverse_exp is None:
-                    inverse_exp = tree.nodes.new(type='CompositorNodeExposure')
-                    inverse_exp.name = inverse_exp_name
-                    inverse_exp.location = (600, -120)
-                inverse_exp.label = inverse_exp_name
-                inverse_factor = 1.0 / max(float(settings.normalization_factor), 1e-8)
-                inverse_exp.inputs[1].default_value = math.log2(max(float(inverse_factor), 1e-8))
-                if not inverse_node.outputs[0].is_linked or not inverse_exp.inputs[0].is_linked:
-                    if inverse_exp.inputs[0].is_linked is False:
-                        tree.links.new(inverse_node.outputs[0], inverse_exp.inputs[0])
-            else:
-                forward_exp = tree.nodes.get(forward_exp_name)
-                if forward_exp is None:
-                    forward_exp = tree.nodes.new(type='ShaderNodeVectorMath')
-                    forward_exp.name = forward_exp_name
-                    forward_exp.location = (600, 180)
-                forward_exp.label = forward_exp_name
-                _set_vector_math_scale_value(forward_exp, settings.normalization_factor)
-                if not forward_node.outputs[0].is_linked or not forward_exp.inputs[0].is_linked:
-                    if forward_exp.inputs[0].is_linked is False:
-                        tree.links.new(forward_node.outputs[0], forward_exp.inputs[0])
-
-                inverse_exp = tree.nodes.get(inverse_exp_name)
-                if inverse_exp is None:
-                    inverse_exp = tree.nodes.new(type='ShaderNodeVectorMath')
-                    inverse_exp.name = inverse_exp_name
-                    inverse_exp.location = (600, -120)
-                inverse_exp.label = inverse_exp_name
-                inverse_factor = 1.0 / max(float(settings.normalization_factor), 1e-8)
-                _set_vector_math_scale_value(inverse_exp, inverse_factor)
-                if not inverse_node.outputs[0].is_linked or not inverse_exp.inputs[0].is_linked:
-                    if inverse_exp.inputs[0].is_linked is False:
-                        tree.links.new(inverse_node.outputs[0], inverse_exp.inputs[0])
-
-        self.report({'INFO'}, f"Created forward matrix '{forward_name}' and inverse matrix '{inverse_name}' with optional exposure scaling based on the checkbox.")
-        return {'FINISHED'}
+        return bpy.ops.macblend.match_transform('INVOKE_DEFAULT')
 
 
 class MB_PT_CalibrationPanel(bpy.types.Panel):
@@ -542,7 +547,9 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
         layout.prop(settings, 'target_colorspace', text='Target')
         layout.prop(settings, 'create_exposure_node', text='Create Exposure Node')
         layout.prop(settings, 'node_name', text='Node Name')
-        layout.operator('macblend.create_transform', text='Create Transform')
+        row = layout.row(align=True)
+        row.operator('macblend.match_transform', text='Match')
+        row.operator('macblend.neutralize_transform', text='Neutralize')
         if settings.calculation_done:
             box = layout.box()
             box.label(text='Matrix:')
@@ -551,6 +558,8 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
 
 
 classes = (
+    MB_OT_MatchTransform,
+    MB_OT_NeutralizeTransform,
     MB_OT_CreateTransform,
     MB_PT_CalibrationPanel,
 )
