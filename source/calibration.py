@@ -526,7 +526,7 @@ def _build_lut_exports(operator, context, *, size, clamp):
 
     try:
         working_space, used_fallback = _scene_linear_working_space(context.scene)
-        neutralize_matrix, match_matrix = lut_writer.compose_export_matrices(
+        forward_matrix, inverse_matrix = lut_writer.compose_export_matrices(
             matrix_3x3,
             normalization_factor,
         )
@@ -541,7 +541,7 @@ def _build_lut_exports(operator, context, *, size, clamp):
     target_name = _lut_target_name(settings)
     normalized = bool(settings.normalize_calibration)
     exports = []
-    for mode, matrix in (("Match", match_matrix), ("Neutralize", neutralize_matrix)):
+    for mode, matrix in (("Forward", forward_matrix), ("Inverse", inverse_matrix)):
         filename = lut_writer.build_lut_filename(
             working_space,
             source_name,
@@ -604,7 +604,7 @@ def _execute_lut_export(operator, context, *, directory, size, clamp, overwrite)
         operator.report({'ERROR'}, f"Could not write LUT files: {exc}")
         return {'CANCELLED'}
 
-    operator.report({'INFO'}, f"Exported Match and Neutralize LUTs to '{directory}'.")
+    operator.report({'INFO'}, f"Exported Forward and Inverse LUTs to '{directory}'.")
     return {'FINISHED'}
 
 
@@ -697,9 +697,46 @@ def _sync_exposure_node(tree, editor_kind, matrix_node, scale_value, enabled):
     return exp_node
 
 
-class MB_OT_MatchTransform(bpy.types.Operator):
-    bl_idname = "macblend.match_transform"
-    bl_label = "Match"
+class MB_OT_ForwardTransform(bpy.types.Operator):
+    bl_idname = "macblend.forward_transform"
+    bl_label = "Forward"
+    bl_description = "Create a transform from the sampled source colors to the selected target colors"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _target_is_selected(context)
+
+    def execute(self, context):
+        settings, editor_kind, tree, matrix_3x3, normalization_factor = _prepare_calibration_data(self, context)
+        if settings is None:
+            return {'CANCELLED'}
+
+        forward_name = _mode_node_name(settings.node_name, 'Forward')
+        forward_node = _create_matrix_node(
+            tree,
+            editor_kind,
+            forward_name,
+            matrix_3x3,
+            label_text='Forward',
+            location=(300, -150),
+        )
+        _sync_exposure_node(
+            tree,
+            editor_kind,
+            forward_node,
+            settings.normalization_factor,
+            settings.create_exposure_node,
+        )
+
+        self.report({'INFO'}, f"Created forward matrix '{forward_name}' with optional exposure scaling.")
+        return {'FINISHED'}
+
+
+class MB_OT_InverseTransform(bpy.types.Operator):
+    bl_idname = "macblend.inverse_transform"
+    bl_label = "Inverse"
+    bl_description = "Create a transform from the selected target colors back to the sampled source colors"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -712,45 +749,24 @@ class MB_OT_MatchTransform(bpy.types.Operator):
             return {'CANCELLED'}
 
         try:
-            match_matrix = np.linalg.inv(matrix_3x3)
+            inverse_matrix = np.linalg.inv(matrix_3x3)
         except np.linalg.LinAlgError:
             self.report({'ERROR'}, "Calculated matrix is singular and cannot be inverted.")
             return {'CANCELLED'}
 
-        match_name = _mode_node_name(settings.node_name, 'Match')
-        match_node = _create_matrix_node(tree, editor_kind, match_name, match_matrix, label_text='Inverse', location=(300, 150))
-        match_factor = 1.0 / max(float(settings.normalization_factor), 1e-8)
-        _sync_exposure_node(tree, editor_kind, match_node, match_factor, settings.create_exposure_node)
-
-        self.report({'INFO'}, f"Created inverse matrix '{match_name}' with optional exposure scaling.")
-        return {'FINISHED'}
-
-
-class MB_OT_NeutralizeTransform(bpy.types.Operator):
-    bl_idname = "macblend.neutralize_transform"
-    bl_label = "Neutralize"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        return _target_is_selected(context)
-
-    def execute(self, context):
-        settings, editor_kind, tree, matrix_3x3, normalization_factor = _prepare_calibration_data(self, context)
-        if settings is None:
-            return {'CANCELLED'}
-
-        neutralize_name = _mode_node_name(settings.node_name, 'Neutralize')
-        neutralize_node = _create_matrix_node(tree, editor_kind, neutralize_name, matrix_3x3, label_text='Forward', location=(300, -150))
-        _sync_exposure_node(
+        inverse_name = _mode_node_name(settings.node_name, 'Inverse')
+        inverse_node = _create_matrix_node(
             tree,
             editor_kind,
-            neutralize_node,
-            settings.normalization_factor,
-            settings.create_exposure_node,
+            inverse_name,
+            inverse_matrix,
+            label_text='Inverse',
+            location=(300, 150),
         )
+        inverse_factor = 1.0 / max(float(settings.normalization_factor), 1e-8)
+        _sync_exposure_node(tree, editor_kind, inverse_node, inverse_factor, settings.create_exposure_node)
 
-        self.report({'INFO'}, f"Created forward matrix '{neutralize_name}' with optional exposure scaling.")
+        self.report({'INFO'}, f"Created inverse matrix '{inverse_name}' with optional exposure scaling.")
         return {'FINISHED'}
 
 
@@ -758,7 +774,7 @@ class MB_OT_ExportLuts(bpy.types.Operator):
     bl_idname = "macblend.export_luts"
     bl_label = "Export LUTs"
     bl_description = (
-        "Export Match and Neutralize LUTs named "
+        "Export Forward and Inverse LUTs named "
         "WorkingSpace_InputImage_Target[_normalized]_Mode.cube"
     )
     bl_options = {'REGISTER'}
@@ -817,7 +833,7 @@ class MB_OT_ConfirmLutOverwrite(bpy.types.Operator):
         layout.label(text="The following LUT files already exist:", icon='ERROR')
         for filename in self.existing_files.splitlines():
             layout.label(text=filename)
-        layout.label(text="Both Match and Neutralize LUTs will be exported.")
+        layout.label(text="Both Forward and Inverse LUTs will be exported.")
 
     def execute(self, context):
         return _execute_lut_export(
@@ -853,8 +869,8 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
         layout.prop(settings, 'create_exposure_node', text='Create Exposure Node')
         layout.prop(settings, 'node_name', text='Node Name')
         row = layout.row(align=True)
-        row.operator('macblend.match_transform', text='Match')
-        row.operator('macblend.neutralize_transform', text='Neutralize')
+        row.operator('macblend.forward_transform', text='Forward')
+        row.operator('macblend.inverse_transform', text='Inverse')
         layout.operator('macblend.export_luts', text='Export LUTs', icon='EXPORT')
         if settings.calculation_done:
             box = layout.box()
@@ -864,8 +880,8 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
 
 
 classes = (
-    MB_OT_MatchTransform,
-    MB_OT_NeutralizeTransform,
+    MB_OT_ForwardTransform,
+    MB_OT_InverseTransform,
     MB_OT_ExportLuts,
     MB_OT_ConfirmLutOverwrite,
     MB_PT_CalibrationPanel,

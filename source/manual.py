@@ -9,8 +9,8 @@ MANUAL_MAPPING = (
     ("bpy.ops.macblend.flip_overlay_vertical", "sampling/index.html"),
     ("bpy.ops.macblend.sample_image_colors", "sampling/index.html"),
     ("bpy.ops.macblend.clear_sample_data", "sampling/index.html"),
-    ("bpy.ops.macblend.match_transform", "calibration/index.html"),
-    ("bpy.ops.macblend.neutralize_transform", "calibration/index.html"),
+    ("bpy.ops.macblend.forward_transform", "calibration/index.html"),
+    ("bpy.ops.macblend.inverse_transform", "calibration/index.html"),
     ("bpy.ops.macblend.export_luts", "export/index.html"),
 )
 

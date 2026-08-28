@@ -54,10 +54,10 @@ class CubeGenerationTests(unittest.TestCase):
 class ExportMatrixTests(unittest.TestCase):
     def test_normalized_matrices_are_inverses(self):
         forward = np.array(((1.1, 0.1, 0), (0, 0.9, 0.1), (0.1, 0, 1.2)))
-        neutralize, match = lut_writer.compose_export_matrices(forward, 1.25)
-        np.testing.assert_allclose(neutralize, forward / 1.25)
-        np.testing.assert_allclose(match, np.linalg.inv(forward) * 1.25)
-        np.testing.assert_allclose(match @ neutralize, np.eye(3), atol=1e-12)
+        forward_export, inverse_export = lut_writer.compose_export_matrices(forward, 1.25)
+        np.testing.assert_allclose(forward_export, forward / 1.25)
+        np.testing.assert_allclose(inverse_export, np.linalg.inv(forward) * 1.25)
+        np.testing.assert_allclose(inverse_export @ forward_export, np.eye(3), atol=1e-12)
 
     def test_rejects_non_positive_normalization(self):
         with self.assertRaises(ValueError):
@@ -71,24 +71,24 @@ class FilenameTests(unittest.TestCase):
         self.assertEqual(source, "source.chart")
         self.assertEqual(
             lut_writer.build_lut_filename(
-                "ACEScg", source, target, normalized=True, mode="Match"
+                "ACEScg", source, target, normalized=True, mode="Inverse"
             ),
-            "ACEScg_source.chart_target_normalized_Match.cube",
+            "ACEScg_source.chart_target_normalized_Inverse.cube",
         )
         unnormalized_filename = lut_writer.build_lut_filename(
-            "Linear Rec.709", source, "LINEAR_SRGB_D65", normalized=False, mode="Neutralize"
+            "Linear Rec.709", source, "LINEAR_SRGB_D65", normalized=False, mode="Forward"
         )
         self.assertEqual(
             unnormalized_filename,
-            "Linear Rec.709_source.chart_LINEAR_SRGB_D65_Neutralize.cube",
+            "Linear Rec.709_source.chart_LINEAR_SRGB_D65_Forward.cube",
         )
         self.assertNotIn("__", unnormalized_filename)
 
     def test_sanitizes_invalid_filename_characters(self):
         filename = lut_writer.build_lut_filename(
-            "ACES/cg", "source:one", "target*two. ", normalized=False, mode="Match"
+            "ACES/cg", "source:one", "target*two. ", normalized=False, mode="Inverse"
         )
-        self.assertEqual(filename, "ACES_cg_source_one_target_two_Match.cube")
+        self.assertEqual(filename, "ACES_cg_source_one_target_two_Inverse.cube")
 
 
 if __name__ == "__main__":

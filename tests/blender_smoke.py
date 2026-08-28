@@ -19,10 +19,18 @@ spec.loader.exec_module(macblend)
 from macblend import calibration, manual, sampling
 
 
+assert calibration.MB_OT_ForwardTransform.bl_description == (
+    "Create a transform from the sampled source colors to the selected target colors"
+)
+assert calibration.MB_OT_InverseTransform.bl_description == (
+    "Create a transform from the selected target colors back to the sampled source colors"
+)
+
 manual_url, manual_mapping = manual.manual_map()
 assert manual_url == "https://manuelhouben.github.io/macblend/"
 assert ("bpy.ops.macblend.sample_image_colors", "sampling/index.html") in manual_mapping
-assert ("bpy.ops.macblend.match_transform", "calibration/index.html") in manual_mapping
+assert ("bpy.ops.macblend.inverse_transform", "calibration/index.html") in manual_mapping
+assert ("bpy.ops.macblend.forward_transform", "calibration/index.html") in manual_mapping
 assert ("bpy.ops.macblend.export_luts", "export/index.html") in manual_mapping
 
 
@@ -52,6 +60,10 @@ assert legacy_cursor_window.cursors == ['HAND_CLOSED', 'HAND']
 macblend.register()
 try:
     assert hasattr(bpy.types.Scene, 'macblend_calibrator_settings')
+    assert hasattr(bpy.types, 'MACBLEND_OT_forward_transform')
+    assert hasattr(bpy.types, 'MACBLEND_OT_inverse_transform')
+    assert not hasattr(bpy.types, 'MACBLEND_OT_match_transform')
+    assert not hasattr(bpy.types, 'MACBLEND_OT_neutralize_transform')
     assert hasattr(bpy.ops.macblend, 'export_luts')
     assert hasattr(bpy.ops.macblend, 'confirm_lut_overwrite')
     assert hasattr(bpy.types.Scene, 'macblend_sampling_ui')
@@ -136,18 +148,18 @@ try:
     assert [contents for _filename, contents in exports] != [
         contents for _filename, contents in unnormalized_exports
     ]
-    unnormalized_neutralize = next(
-        contents for filename, contents in unnormalized_exports if filename.endswith('_Neutralize.cube')
+    unnormalized_forward = next(
+        contents for filename, contents in unnormalized_exports if filename.endswith('_Forward.cube')
     )
-    normalized_neutralize = next(
-        contents for filename, contents in exports if filename.endswith('_Neutralize.cube')
+    normalized_forward = next(
+        contents for filename, contents in exports if filename.endswith('_Forward.cube')
     )
-    unnormalized_white = tuple(float(value) for value in unnormalized_neutralize.splitlines()[-1].split())
-    normalized_white = tuple(float(value) for value in normalized_neutralize.splitlines()[-1].split())
+    unnormalized_white = tuple(float(value) for value in unnormalized_forward.splitlines()[-1].split())
+    normalized_white = tuple(float(value) for value in normalized_forward.splitlines()[-1].split())
     assert all(normalized < unnormalized for normalized, unnormalized in zip(normalized_white, unnormalized_white))
     assert {filename.rsplit('_', 1)[-1] for filename, _contents in exports} == {
-        'Match.cube',
-        'Neutralize.cube',
+        'Forward.cube',
+        'Inverse.cube',
     }
     assert len(bpy.data.node_groups) == node_group_count
     assert sum(len(group.nodes) for group in bpy.data.node_groups) == node_count
@@ -208,7 +220,7 @@ try:
     material.use_nodes = True
     tree = material.node_tree
     unowned_node = tree.nodes.new('ShaderNodeValue')
-    requested_name = "MacBlendCalibrationNeutralize"
+    requested_name = "MacBlendCalibrationForward"
     unowned_node.name = requested_name
 
     matrix_node = calibration._create_matrix_node(

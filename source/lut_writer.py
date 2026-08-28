@@ -61,9 +61,9 @@ def compose_export_matrices(forward_matrix, normalization_factor=1.0):
         inverse_matrix = np.linalg.inv(forward_matrix)
     except np.linalg.LinAlgError as exc:
         raise ValueError("Calibration matrix is singular and cannot be inverted.") from exc
-    neutralize_matrix = forward_matrix / normalization_factor
-    match_matrix = inverse_matrix * normalization_factor
-    return neutralize_matrix, match_matrix
+    forward_export_matrix = forward_matrix / normalization_factor
+    inverse_export_matrix = inverse_matrix * normalization_factor
+    return forward_export_matrix, inverse_export_matrix
 
 
 def image_name_token(image_name):
@@ -76,8 +76,8 @@ def sanitize_filename_token(value):
 
 
 def build_lut_filename(working_space, source_name, target_name, *, normalized, mode):
-    if mode not in {"Match", "Neutralize"}:
-        raise ValueError("LUT mode must be 'Match' or 'Neutralize'.")
+    if mode not in {"Forward", "Inverse"}:
+        raise ValueError("LUT mode must be 'Forward' or 'Inverse'.")
     working_space = sanitize_filename_token(working_space)
     source_name = sanitize_filename_token(source_name)
     target_name = sanitize_filename_token(target_name)

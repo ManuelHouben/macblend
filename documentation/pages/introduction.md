@@ -32,6 +32,6 @@ The [Method and limitations](method.md#before-you-start) page explains the setup
 2. Align the chart overlay and sample its 24 patches.
 3. Optionally sample a target image.
 4. Open a supported node editor and configure the calibration.
-5. Create Match or Neutralize nodes, or export both LUT directions.
+5. Create Forward or Inverse nodes, or export both LUT directions.
 
 See [Method and limitations](method.md) for the calculation, normalization behavior, transform directions, and assumptions.

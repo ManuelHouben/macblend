@@ -18,9 +18,9 @@ First, align the four overlay corners with the four corners of the chart. MacBle
 
 You can either sample a second chart image as the target, useful for matching camera A to camera B, or use MacBlend's built-in chart references. The built-in references start from D65 values and are converted for the recorded gamut you choose.
 
-## What Match and Neutralize mean
+## What Forward and Inverse mean
 
-**Neutralize** creates the correction that moves the sampled source chart toward the selected target. **Match** creates the reverse direction. Both are written when you export LUTs.
+**Forward** moves the sampled source toward the selected target. **Inverse** moves data from the selected target back toward the sampled source. Both directions are written when you export LUTs.
 
 **Normalize** handles a broad brightness difference before the color correction is calculated. **Create Exposure Node** keeps that brightness adjustment visible as its own node after the color transform. Leave it enabled when you want to inspect or adjust that exposure change separately.
 
