@@ -1,6 +1,6 @@
 # LUT export
 
-**Export LUTs** calculates the configured transform and writes both Match and Neutralize LUTs in Adobe/Iridas `.cube` format.
+**Export LUTs** calculates the configured transform and writes both Forward and Inverse LUTs in Adobe/Iridas `.cube` format.
 
 ## Export options
 
@@ -12,6 +12,6 @@ Choose an output directory and confirm the export. If either destination filenam
 
 ## Files
 
-Filenames describe the working space, input image, target, normalization state, and transform direction. Every export produces one filename ending in `_Match.cube` and one ending in `_Neutralize.cube`.
+Filenames describe the working space, input image, target, normalization state, and transform direction. Every export produces one filename ending in `_Forward.cube` and one ending in `_Inverse.cube`.
 
 The files include a title, lattice size, domain minimum and maximum, and RGB values with red changing fastest. Test exported LUTs in the destination application because LUT interpretation and out-of-range handling vary between hosts.

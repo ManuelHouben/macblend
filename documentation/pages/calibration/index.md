@@ -17,15 +17,15 @@ With the default normalization, MacBlend uses the Neutral 5 patch and Rec.709 lu
 
 Change **Node Name** only when generated node groups need a different base name.
 
-## Match
+## Forward
 
-**Match** creates the inverse of the fitted calibration matrix. Use it to transform material or compositor data toward the selected target appearance. When exposure-node creation is enabled, MacBlend adds the reciprocal normalization scale after the matrix.
+**Forward** creates the fitted calibration matrix. It transforms material or compositor data from the sampled source toward the selected target. When enabled, the exposure node receives the stored normalization scale.
 
-## Neutralize
+## Inverse
 
-**Neutralize** creates the forward fitted matrix. Use it for the opposite transform direction. When enabled, the exposure node receives the stored normalization scale.
+**Inverse** creates the inverse of the fitted calibration matrix. It transforms data from the selected target back toward the sampled source. When exposure-node creation is enabled, MacBlend adds the reciprocal normalization scale after the matrix.
 
-Both commands require a valid source and target and a supported node editor. A singular fitted matrix cannot be inverted for Match.
+Both commands require a valid source and target and a supported node editor. A singular fitted matrix cannot be inverted for **Inverse**.
 
 ## Matrix result
 

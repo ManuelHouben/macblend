@@ -18,9 +18,9 @@ The image must have a valid pixel resolution and a supported channel count. Redu
 
 Enable **Debug Logging** in the MacBlend extension preferences to print pixel-transfer, patch-average, and calibration diagnostics to Blender's console.
 
-## A Match transform cannot be created
+## An Inverse transform cannot be created
 
-Match requires the fitted matrix to be invertible. Check for missing, uniform, clipped, or incorrectly ordered samples. Resample the chart after correcting the image and overlay.
+Inverse requires the fitted matrix to be invertible. Check for missing, uniform, clipped, or incorrectly ordered samples. Resample the chart after correcting the image and overlay.
 
 ## Reporting a problem
 

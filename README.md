@@ -27,7 +27,7 @@ Optionally repeat this process on a second image to create an image-to-image tra
 
 ### 2. Compositor or Shader Editor
 
-Select the sampled source image. Choose the reference-target gamut, configure normalization and separate exposure-node creation, name the transform, and select **Match** or **Neutralize**.
+Select the sampled source image. Choose the reference-target gamut, configure normalization and separate exposure-node creation, name the transform, and select **Forward** or **Inverse**.
 
 To use the second sampled image as the target, disable **Use reference values as target** and select that image. Select **Export LUTs** to write both transform directions as `.cube` files.
 
