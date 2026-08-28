@@ -16,6 +16,7 @@ from bpy.props import (
 
 from . import calibration
 from . import colorspaces
+from . import manual
 from . import sampling
 
 
@@ -229,6 +230,8 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    manual.register()
+
     bpy.types.Scene.macblend_calibrator_settings = PointerProperty(type=MacBlendCalibratorSettings)
     bpy.types.Scene.macblend_sampling_ui = PointerProperty(type=sampling.MB_SamplingUIState)
     bpy.types.Image.mb_sample_data = PointerProperty(type=sampling.MB_ImageSampleData)
@@ -241,6 +244,7 @@ def register():
 
 def unregister():
     sampling.MB_Messagebus_Remove()
+    manual.unregister()
 
     if sampling.MB_Messagebus_LoadPost in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(sampling.MB_Messagebus_LoadPost)
