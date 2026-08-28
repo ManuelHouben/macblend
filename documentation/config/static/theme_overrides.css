@@ -1,0 +1,26 @@
+:root {
+    --macblend-accent-warm: #c9512c;
+}
+
+.sidebar-brand-text {
+    display: block;
+    font-size: 2rem;
+    font-weight: 700;
+    text-align: center;
+}
+
+.sidebar-logo-container {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 0;
+}
+
+.sidebar-logo {
+    width: 128px;
+    height: 128px;
+    object-fit: contain;
+}
+
+.content a:hover {
+    text-decoration-color: var(--macblend-accent-warm);
+}

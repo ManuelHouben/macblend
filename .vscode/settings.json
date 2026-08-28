@@ -1,0 +1,9 @@
+{
+	"blender.addon.addonPath": "./source",
+	"blender.environmentVariables": {
+		"BLENDER_USER_RESOURCES": "${workspaceFolder}/blender_vscode_development"
+	},
+	"blender.additionalArguments": [
+		"--factory-startup"
+	]
+}

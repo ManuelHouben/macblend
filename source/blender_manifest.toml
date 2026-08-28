@@ -6,7 +6,8 @@ tagline = "Calibrate colors in your scene using a Macbeth chart"
 type = "add-on"
 maintainer = "Manuel Houben"
 version = "1.0.1"
-website = "https://github.com/ManuelHouben/macblend"
+website = "https://manuelhouben.github.io/macblend/"
+support = "https://github.com/ManuelHouben/macblend/issues/new?template=bug_report.md"
 blender_version_min = "4.2.0"
 tags = ["Compositing", "Pipeline"]
 license = ["SPDX:GPL-3.0-or-later"]
@@ -19,14 +20,9 @@ copyright = [
 files = "Read color data and write LUTs to user-selected folders"
 
 [build]
-paths = [
-	"__init__.py",
-	"calibration.py",
-	"colorspaces.py",
-	"core.py",
-	"LICENSE",
-	"lut_writer.py",
-	"mmColorTarget_colorspace_transforms.json",
-	"sampling.py",
-	"THIRD_PARTY_NOTICES.md",
+paths_exclude_pattern = [
+	"__pycache__/",
+	"/.git/",
+	".*",
+	"/*.zip",
 ]
