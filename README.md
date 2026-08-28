@@ -72,8 +72,6 @@ blender --command extension validate
 blender --command extension build --output-dir ../dist
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete development and documentation workflow.
-
 ## License
 
 MacBlend is licensed under the [GNU General Public License v3.0 or later](LICENSE). Third-party acknowledgements are listed in [source/THIRD_PARTY_NOTICES.md](source/THIRD_PARTY_NOTICES.md).
