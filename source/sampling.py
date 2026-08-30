@@ -26,6 +26,7 @@ MB_CORNER_CROSS_OUTLINE_WIDTH = 2.0
 MB_CORNER_CROSS_SCALE = MB_CORNER_CROSS_CORE_LENGTH + (2.0 * MB_CORNER_CROSS_OUTLINE_WIDTH)
 MB_CHART_ASPECT_RATIO = 28.0 / 21.0
 MB_CHART_AREA_FRACTION = 0.25
+MB_PRECISION_DRAG_FACTOR = 0.1
 
 MB_MACBETH_REFERENCE_SRGB = (
     (116 / 255.0, 81 / 255.0, 67 / 255.0),
@@ -627,8 +628,10 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
         try:
             homography = core.build_chart_homography(corners)
         except ValueError:
-            for gizmo in self.outlines + self.fills + self.corners + self.flip_buttons:
+            for gizmo in self.outlines + self.fills + self.flip_buttons:
                 gizmo.hide = True
+            for corner_idx, corner_gizmo in enumerate(self.corners):
+                self._set_cross(corner_gizmo, context, corners[corner_idx])
             return
         # Blender gizmo triangle fills can show internal seams at exactly 1.0 alpha.
         # Keep render alpha infinitesimally below opaque to avoid the artifact.
@@ -693,7 +696,10 @@ class MB_OT_AdjustOverlayCorner(bpy.types.Operator):
         corner_labels = ('Top Left', 'Top Right', 'Bottom Right', 'Bottom Left')
         corner_idx = int(getattr(properties, 'corner_idx', -1))
         if 0 <= corner_idx < len(corner_labels):
-            return f"Adjust the {corner_labels[corner_idx]} corner of the Macbeth chart overlay"
+            return (
+                f"Adjust the {corner_labels[corner_idx]} corner of the Macbeth chart overlay; "
+                "hold Ctrl to move the entire chart and Shift for precision"
+            )
         return cls.bl_label
 
     def invoke(self, context, event):
@@ -703,9 +709,13 @@ class MB_OT_AdjustOverlayCorner(bpy.types.Operator):
 
         self.image = image
         self.data = image.mb_sample_data
-        corner_name = ('corner_tl', 'corner_tr', 'corner_br', 'corner_bl')[self.corner_idx]
-        self.start_value = tuple(getattr(self.data, corner_name))
-        self.start_mouse_coords = tuple(context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y))
+        self.start_corners = {
+            name: tuple(getattr(self.data, name))
+            for name in ('corner_tl', 'corner_tr', 'corner_br', 'corner_bl')
+        }
+        self.previous_mouse_coords = tuple(
+            context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+        )
 
         _set_drag_cursor(context.window)
         context.window_manager.modal_handler_add(self)
@@ -715,7 +725,8 @@ class MB_OT_AdjustOverlayCorner(bpy.types.Operator):
         corner_name = ('corner_tl', 'corner_tr', 'corner_br', 'corner_bl')[self.corner_idx]
 
         if event.type in {'RIGHTMOUSE', 'ESC'}:
-            setattr(self.data, corner_name, self.start_value)
+            for name, start_value in self.start_corners.items():
+                setattr(self.data, name, start_value)
             context.window.cursor_modal_restore()
             _tag_image_editor_redraw()
             return {'CANCELLED'}
@@ -723,14 +734,28 @@ class MB_OT_AdjustOverlayCorner(bpy.types.Operator):
         if event.type == 'MOUSEMOVE':
             current_mouse_coords = tuple(context.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y))
             delta = (
-                current_mouse_coords[0] - self.start_mouse_coords[0],
-                current_mouse_coords[1] - self.start_mouse_coords[1],
+                current_mouse_coords[0] - self.previous_mouse_coords[0],
+                current_mouse_coords[1] - self.previous_mouse_coords[1],
             )
-            new_value = (
-                self.start_value[0] + delta[0],
-                self.start_value[1] + delta[1],
-            )
-            setattr(self.data, corner_name, new_value)
+            self.previous_mouse_coords = current_mouse_coords
+            if event.shift:
+                delta = tuple(component * MB_PRECISION_DRAG_FACTOR for component in delta)
+
+            if event.ctrl:
+                for name in self.start_corners:
+                    current_value = tuple(getattr(self.data, name))
+                    setattr(
+                        self.data,
+                        name,
+                        (current_value[0] + delta[0], current_value[1] + delta[1]),
+                    )
+            else:
+                current_value = tuple(getattr(self.data, corner_name))
+                setattr(
+                    self.data,
+                    corner_name,
+                    (current_value[0] + delta[0], current_value[1] + delta[1]),
+                )
             _tag_image_editor_redraw()
 
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
