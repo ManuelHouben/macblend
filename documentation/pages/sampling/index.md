@@ -16,7 +16,7 @@ Patch Size is measured in image pixels. Larger values average more pixels but ca
 Enable **Show Overlay**, then drag each corner handle onto the corresponding outer corner of the chart.
 Use **Flip Horizontal** or **Flip Vertical** when the patch order does not match the image orientation.
 
-While dragging a corner, hold **Shift** for precision movement or **Ctrl** to move all four corners together. Hold **Ctrl** and **Shift** together to move the entire chart with precision. These modifiers can be pressed or released after the drag has started.
+While dragging a corner, use the mouse wheel to scale the chart around that corner. Scroll up to enlarge the chart or down to shrink it. Hold **Ctrl** to move all four corners together, or hold **Ctrl** and **Alt** and drag horizontally to rotate the chart around the selected corner. Hold **Shift** for precision movement or rotation. These modifiers can be pressed or released after the drag has started.
 
 Use **Center Overlay** to reset the overlay to a centered 28:21 rectangle occupying approximately 25 percent of the image.
 
