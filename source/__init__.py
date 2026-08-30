@@ -215,6 +215,7 @@ classes = (
     sampling.MB_OT_FlipOverlayHorizontal,
     sampling.MB_OT_FlipOverlayVertical,
     sampling.MB_OT_CenterOverlayChart,
+    sampling.MB_OT_OpenPanoramaChartView,
     sampling.MB_OT_SampleImageColors,
     sampling.MB_OT_ClearSampleData,
     sampling.MB_PT_ImageEditorSamplePanel,

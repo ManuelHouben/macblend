@@ -63,6 +63,65 @@ class PixelBufferSamplingTests(unittest.TestCase):
             core.sample_pixel_buffer(np.zeros((4, 4), dtype=np.float32), 2, 2, 3)
 
 
+class PanoramaSamplingTests(unittest.TestCase):
+    def test_center_sample_wraps_across_panorama_seam(self):
+        pixels = np.zeros((3, 4, 3), dtype=np.float32)
+        pixels[:, 0] = (1.0, 0.0, 0.0)
+        pixels[:, -1] = (0.0, 0.0, 1.0)
+
+        sample = core.sample_rectilinear_patch(
+            pixels,
+            (3, 3),
+            1.0,
+            1.0,
+            1,
+            heading=np.pi,
+            elevation=0.0,
+            roll=0.0,
+            horizontal_fov=np.deg2rad(60.0),
+        )
+
+        np.testing.assert_allclose(sample, (0.5, 0.0, 0.5), atol=1e-6)
+
+    def test_view_center_maps_to_heading_and_elevation(self):
+        panorama_u, panorama_v = core.rectilinear_to_equirectangular_uv(
+            0.5,
+            0.5,
+            heading=np.deg2rad(90.0),
+            elevation=np.deg2rad(30.0),
+            roll=0.0,
+            horizontal_fov=np.deg2rad(60.0),
+            aspect_ratio=1.0,
+        )
+
+        np.testing.assert_allclose((panorama_u, panorama_v), (0.75, 2.0 / 3.0), atol=1e-6)
+
+    def test_rectilinear_projection_round_trip_near_panorama_seam(self):
+        projection = {
+            'heading': np.pi,
+            'elevation': np.deg2rad(10.0),
+            'roll': np.deg2rad(5.0),
+            'horizontal_fov': np.deg2rad(70.0),
+            'aspect_ratio': 4.0 / 3.0,
+        }
+        view_u = np.array((0.2, 0.8, 0.75, 0.25))
+        view_v = np.array((0.8, 0.8, 0.2, 0.2))
+        panorama_u, panorama_v = core.rectilinear_to_equirectangular_uv(
+            view_u,
+            view_v,
+            **projection,
+        )
+
+        restored_u, restored_v = core.equirectangular_to_rectilinear_uv(
+            panorama_u,
+            panorama_v,
+            **projection,
+        )
+
+        np.testing.assert_allclose(restored_u, view_u, atol=1e-6)
+        np.testing.assert_allclose(restored_v, view_v, atol=1e-6)
+
+
 class HomographyTests(unittest.TestCase):
     def test_identity_quad_maps_uv_directly(self):
         transform = core.build_chart_homography(((0, 1), (1, 1), (1, 0), (0, 0)))

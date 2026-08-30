@@ -74,6 +74,174 @@ def sample_pixel_buffer(pixel_buffer, center_x, center_y, patch_size):
     return tuple(np.mean(rgb_region, axis=(0, 1), dtype=np.float64).astype(np.float32))
 
 
+def rectilinear_to_equirectangular_uv(
+    view_u,
+    view_v,
+    *,
+    heading,
+    elevation,
+    roll,
+    horizontal_fov,
+    aspect_ratio,
+):
+    """Map normalized rectilinear view coordinates to wrapped panorama UVs."""
+    if not 0.0 < horizontal_fov < np.pi:
+        raise ValueError("Horizontal field of view must be between 0 and pi radians.")
+    if aspect_ratio <= 0.0:
+        raise ValueError("View aspect ratio must be positive.")
+
+    view_u, view_v = np.broadcast_arrays(
+        np.asarray(view_u, dtype=np.float64),
+        np.asarray(view_v, dtype=np.float64),
+    )
+    tangent_x = np.tan(horizontal_fov * 0.5)
+    local_x = (2.0 * view_u - 1.0) * tangent_x
+    local_y = (2.0 * view_v - 1.0) * tangent_x / aspect_ratio
+
+    cos_roll = np.cos(roll)
+    sin_roll = np.sin(roll)
+    rolled_x = local_x * cos_roll - local_y * sin_roll
+    rolled_y = local_x * sin_roll + local_y * cos_roll
+
+    sin_heading = np.sin(heading)
+    cos_heading = np.cos(heading)
+    sin_elevation = np.sin(elevation)
+    cos_elevation = np.cos(elevation)
+    forward = np.array((sin_heading * cos_elevation, sin_elevation, cos_heading * cos_elevation))
+    right = np.array((cos_heading, 0.0, -sin_heading))
+    up = np.array((-sin_heading * sin_elevation, cos_elevation, -cos_heading * sin_elevation))
+
+    direction = (
+        forward
+        + rolled_x[..., np.newaxis] * right
+        + rolled_y[..., np.newaxis] * up
+    )
+    direction /= np.linalg.norm(direction, axis=-1, keepdims=True)
+    panorama_u = np.mod(np.arctan2(direction[..., 0], direction[..., 2]) / (2.0 * np.pi) + 0.5, 1.0)
+    panorama_v = np.arcsin(np.clip(direction[..., 1], -1.0, 1.0)) / np.pi + 0.5
+    return panorama_u, panorama_v
+
+
+def equirectangular_to_rectilinear_uv(
+    panorama_u,
+    panorama_v,
+    *,
+    heading,
+    elevation,
+    roll,
+    horizontal_fov,
+    aspect_ratio,
+):
+    """Map normalized panorama coordinates into a rectilinear view."""
+    if not 0.0 < horizontal_fov < np.pi:
+        raise ValueError("Horizontal field of view must be between 0 and pi radians.")
+    if aspect_ratio <= 0.0:
+        raise ValueError("View aspect ratio must be positive.")
+
+    panorama_u, panorama_v = np.broadcast_arrays(
+        np.asarray(panorama_u, dtype=np.float64),
+        np.asarray(panorama_v, dtype=np.float64),
+    )
+    longitude = (panorama_u - 0.5) * (2.0 * np.pi)
+    latitude = (panorama_v - 0.5) * np.pi
+    cos_latitude = np.cos(latitude)
+    direction = np.stack(
+        (
+            np.sin(longitude) * cos_latitude,
+            np.sin(latitude),
+            np.cos(longitude) * cos_latitude,
+        ),
+        axis=-1,
+    )
+
+    sin_heading = np.sin(heading)
+    cos_heading = np.cos(heading)
+    sin_elevation = np.sin(elevation)
+    cos_elevation = np.cos(elevation)
+    forward = np.array((sin_heading * cos_elevation, sin_elevation, cos_heading * cos_elevation))
+    right = np.array((cos_heading, 0.0, -sin_heading))
+    up = np.array((-sin_heading * sin_elevation, cos_elevation, -cos_heading * sin_elevation))
+    forward_depth = direction @ forward
+    if np.any(forward_depth <= 1e-8):
+        raise ValueError("Panorama point lies outside the forward rectilinear hemisphere.")
+
+    rolled_x = (direction @ right) / forward_depth
+    rolled_y = (direction @ up) / forward_depth
+    cos_roll = np.cos(roll)
+    sin_roll = np.sin(roll)
+    local_x = rolled_x * cos_roll + rolled_y * sin_roll
+    local_y = -rolled_x * sin_roll + rolled_y * cos_roll
+    tangent_x = np.tan(horizontal_fov * 0.5)
+    view_u = (local_x / tangent_x + 1.0) * 0.5
+    view_v = (local_y * aspect_ratio / tangent_x + 1.0) * 0.5
+    return view_u, view_v
+
+
+def bilinear_sample_equirectangular(pixel_buffer, panorama_u, panorama_v):
+    """Sample panorama UVs, wrapping horizontally and clamping vertically."""
+    pixels = normalize_rgb_channels(np.asarray(pixel_buffer, dtype=np.float32))
+    if pixels.ndim != 3:
+        raise ValueError("Pixel buffer must have shape (height, width, channels).")
+
+    height, width, _channels = pixels.shape
+    if width <= 0 or height <= 0:
+        raise ValueError("Image has no sampleable pixel area.")
+
+    panorama_u, panorama_v = np.broadcast_arrays(
+        np.asarray(panorama_u, dtype=np.float64),
+        np.asarray(panorama_v, dtype=np.float64),
+    )
+    pixel_x = np.mod(panorama_u, 1.0) * width - 0.5
+    pixel_y = np.clip(panorama_v, 0.0, 1.0) * height - 0.5
+    x0 = np.floor(pixel_x).astype(np.int64)
+    y0 = np.floor(pixel_y).astype(np.int64)
+    x1 = np.mod(x0 + 1, width)
+    y1 = np.clip(y0 + 1, 0, height - 1)
+    x0 = np.mod(x0, width)
+    y0 = np.clip(y0, 0, height - 1)
+    weight_x = (pixel_x - np.floor(pixel_x))[..., np.newaxis]
+    weight_y = (pixel_y - np.floor(pixel_y))[..., np.newaxis]
+
+    top = pixels[y0, x0] * (1.0 - weight_x) + pixels[y0, x1] * weight_x
+    bottom = pixels[y1, x0] * (1.0 - weight_x) + pixels[y1, x1] * weight_x
+    return top * (1.0 - weight_y) + bottom * weight_y
+
+
+def render_rectilinear_view(pixel_buffer, view_size, **projection):
+    width, height = view_size
+    if width <= 0 or height <= 0:
+        raise ValueError("View dimensions must be positive.")
+    view_u = (np.arange(width, dtype=np.float64) + 0.5) / width
+    view_v = (np.arange(height, dtype=np.float64) + 0.5) / height
+    grid_u, grid_v = np.meshgrid(view_u, view_v)
+    panorama_u, panorama_v = rectilinear_to_equirectangular_uv(
+        grid_u,
+        grid_v,
+        aspect_ratio=width / height,
+        **projection,
+    )
+    return bilinear_sample_equirectangular(pixel_buffer, panorama_u, panorama_v).astype(np.float32)
+
+
+def sample_rectilinear_patch(pixel_buffer, view_size, center_x, center_y, patch_size, **projection):
+    width, height = view_size
+    bounds = clamp_sample_region(view_size, center_x, center_y, patch_size)
+    if bounds is None:
+        raise ValueError("View has no sampleable pixel area.")
+    x_start, x_end, y_start, y_end = bounds
+    view_u = (np.arange(x_start, x_end, dtype=np.float64) + 0.5) / width
+    view_v = (np.arange(y_start, y_end, dtype=np.float64) + 0.5) / height
+    grid_u, grid_v = np.meshgrid(view_u, view_v)
+    panorama_u, panorama_v = rectilinear_to_equirectangular_uv(
+        grid_u,
+        grid_v,
+        aspect_ratio=width / height,
+        **projection,
+    )
+    samples = bilinear_sample_equirectangular(pixel_buffer, panorama_u, panorama_v)
+    return tuple(np.mean(samples, axis=(0, 1), dtype=np.float64).astype(np.float32))
+
+
 def _validate_quad(corners):
     points = np.asarray(corners, dtype=np.float64)
     if points.shape != (4, 2) or not np.all(np.isfinite(points)):

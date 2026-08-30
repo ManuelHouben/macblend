@@ -8,9 +8,11 @@ from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty,
     CollectionProperty,
+    EnumProperty,
     FloatProperty,
     FloatVectorProperty,
     IntProperty,
+    PointerProperty,
     StringProperty,
 )
 
@@ -26,7 +28,9 @@ MB_CORNER_CROSS_CORE_WIDTH = 3.0
 MB_CORNER_CROSS_OUTLINE_WIDTH = 2.0
 MB_CORNER_CROSS_SCALE = MB_CORNER_CROSS_CORE_LENGTH + (2.0 * MB_CORNER_CROSS_OUTLINE_WIDTH)
 MB_CHART_ASPECT_RATIO = 28.0 / 21.0
-MB_CHART_AREA_FRACTION = 0.25
+MB_CHART_AREA_FRACTION = 0.10
+MB_PANORAMA_VIEW_SIZE = (1024, 768)
+MB_PANORAMA_VIEW_MARKER = 'macblend_panorama_chart_view'
 MB_PRECISION_DRAG_FACTOR = 0.1
 MB_WHEEL_SCALE_FACTOR = 1.05
 MB_ROTATE_RADIANS_PER_PIXEL = 0.01
@@ -103,6 +107,8 @@ MB_CCMASTER = tuple((slot, name) for slot, name in enumerate(MB_MACBETH_PATCH_NA
 
 MB_SAMPLE_PROPERTY_NAMES = tuple(f"sample_patch_{index + 1:02d}" for index in range(24))
 _MB_SYNCING_SAMPLE_SELECTION = False
+_MB_PANORAMA_PIXEL_CACHE = {}
+_MB_UPDATING_PROJECTED_CORNERS = False
 
 
 def _lerp_2d(point_a, point_b, factor):
@@ -131,6 +137,22 @@ def _corner_target_point(corners, corner_idx):
     return corners[corner_idx]
 
 
+def _opposite_line_midpoint(line_start, line_end, inside_point):
+    midpoint = _lerp_2d(line_start, line_end, 0.5)
+    axis_x = line_end[0] - line_start[0]
+    axis_y = line_end[1] - line_start[1]
+    axis_length = max((axis_x ** 2 + axis_y ** 2) ** 0.5, 1e-6)
+    normal = (-axis_y / axis_length, axis_x / axis_length)
+    inside_distance = (
+        (inside_point[0] - midpoint[0]) * normal[0]
+        + (inside_point[1] - midpoint[1]) * normal[1]
+    )
+    return (
+        midpoint[0] - inside_distance * normal[0],
+        midpoint[1] - inside_distance * normal[1],
+    )
+
+
 def _region_point(context, point):
     region = context.region
     if region is None:
@@ -143,6 +165,28 @@ def _tag_image_editor_redraw():
         for area in window.screen.areas:
             if area.type == 'IMAGE_EDITOR':
                 area.tag_redraw()
+
+
+def _fit_image_in_editor(context):
+    area = getattr(context, 'area', None)
+    if area is None or area.type != 'IMAGE_EDITOR':
+        return
+
+    window_region = next(
+        (region for region in area.regions if region.type == 'WINDOW'),
+        None,
+    )
+    if window_region is None:
+        return
+
+    try:
+        with context.temp_override(
+            area=area,
+            region=window_region,
+        ):
+            bpy.ops.image.view_all(fit_view=True)
+    except (RuntimeError, TypeError):
+        pass
 
 
 def _set_sample_patch_value(data, sample_idx, rgb_value):
@@ -279,26 +323,220 @@ def _load_image_pixel_buffer(image):
     return pixels.reshape((height, width, channels))
 
 
-def _center_overlay_corners(data, image_width, image_height, chart_aspect_ratio=MB_CHART_ASPECT_RATIO, area_fraction=MB_CHART_AREA_FRACTION):
+def _cached_panorama_pixel_buffer(image):
+    width, height = image.size
+    signature = (int(width), int(height), int(image.channels), len(image.pixels))
+    cache_key = int(image.as_pointer())
+    cached = _MB_PANORAMA_PIXEL_CACHE.get(cache_key)
+    if cached is None or cached[0] != signature:
+        cached = (signature, _load_image_pixel_buffer(image))
+        _MB_PANORAMA_PIXEL_CACHE[cache_key] = cached
+    return cached[1]
+
+
+def _clear_panorama_pixel_cache(image=None):
+    if image is None:
+        _MB_PANORAMA_PIXEL_CACHE.clear()
+    else:
+        _MB_PANORAMA_PIXEL_CACHE.pop(int(image.as_pointer()), None)
+
+
+def _panorama_projection(data):
+    return {
+        'heading': float(data.panorama_heading),
+        'elevation': float(data.panorama_elevation),
+        'roll': float(data.panorama_roll),
+        'horizontal_fov': float(data.panorama_fov),
+    }
+
+
+def _panorama_source(image):
+    data = getattr(image, 'mb_sample_data', None)
+    return getattr(data, 'panorama_source_image', None) if data is not None else None
+
+
+def _find_panorama_view(source_image):
+    return next(
+        (
+            image
+            for image in bpy.data.images
+            if image.get(MB_PANORAMA_VIEW_MARKER) and _panorama_source(image) == source_image
+        ),
+        None,
+    )
+
+
+def _refresh_panorama_view(source_image, view_image):
+    source_pixels = _cached_panorama_pixel_buffer(source_image)
+    view_pixels = core.render_rectilinear_view(
+        source_pixels,
+        MB_PANORAMA_VIEW_SIZE,
+        **_panorama_projection(source_image.mb_sample_data),
+    )
+    rgba_pixels = np.empty((*view_pixels.shape[:2], 4), dtype=np.float32)
+    rgba_pixels[..., :3] = view_pixels
+    rgba_pixels[..., 3] = 1.0
+    view_image.pixels.foreach_set(rgba_pixels.ravel())
+    view_image.update()
+
+
+def _panorama_projection_changed(data, context):
+    if data.projection_mode != 'EQUIRECTANGULAR':
+        return
+    source_image = getattr(data, 'id_data', None)
+    view_image = _find_panorama_view(source_image) if source_image is not None else None
+    if view_image is None:
+        return
+    try:
+        _refresh_panorama_view(source_image, view_image)
+    except (ValueError, MemoryError, RuntimeError) as exc:
+        print(f'[MacBlend] Could not refresh panorama chart view: {exc}')
+
+
+def _panorama_angles_from_overlay(corners, horizontal_fov, aspect_ratio):
+    corner_array = np.asarray(corners, dtype=np.float64)
+    longitude_angles = corner_array[:, 0] * (2.0 * np.pi)
+    mean_sin = float(np.mean(np.sin(longitude_angles)))
+    mean_cos = float(np.mean(np.cos(longitude_angles)))
+    if np.hypot(mean_sin, mean_cos) < 1e-8:
+        longitude_reference = float(np.mean(corner_array[:, 0]))
+    else:
+        longitude_reference = float(np.mod(np.arctan2(mean_sin, mean_cos) / (2.0 * np.pi), 1.0))
+
+    unwrapped_corners = corner_array.copy()
+    unwrapped_corners[:, 0] = longitude_reference + np.mod(
+        corner_array[:, 0] - longitude_reference + 0.5,
+        1.0,
+    ) - 0.5
+    homography = core.build_chart_homography(unwrapped_corners)
+    middle_left = core.map_chart_point(homography, 0.0, 0.5)
+    middle_right = core.map_chart_point(homography, 1.0, 0.5)
+    middle_points = np.asarray((middle_left, middle_right), dtype=np.float64)
+    longitude = (middle_points[:, 0] - 0.5) * (2.0 * np.pi)
+    latitude = (middle_points[:, 1] - 0.5) * np.pi
+    cos_latitude = np.cos(latitude)
+    directions = np.stack(
+        (
+            np.sin(longitude) * cos_latitude,
+            np.sin(latitude),
+            np.cos(longitude) * cos_latitude,
+        ),
+        axis=-1,
+    )
+    forward = directions[0] + directions[1]
+    forward_length = float(np.linalg.norm(forward))
+    if forward_length <= 1e-8:
+        raise ValueError("Chart middle spans opposing panorama directions.")
+    forward /= forward_length
+    heading = float(np.arctan2(forward[0], forward[2]))
+    elevation = float(np.arcsin(np.clip(forward[1], -1.0, 1.0)))
+
+    middle_u, middle_v = core.equirectangular_to_rectilinear_uv(
+        np.mod((middle_left[0], middle_right[0]), 1.0),
+        (middle_left[1], middle_right[1]),
+        heading=heading,
+        elevation=elevation,
+        roll=0.0,
+        horizontal_fov=horizontal_fov,
+        aspect_ratio=aspect_ratio,
+    )
+    roll = float(np.arctan2(
+        (middle_v[1] - middle_v[0]) / aspect_ratio,
+        middle_u[1] - middle_u[0],
+    ))
+    return heading, elevation, roll
+
+
+def _store_projected_corners_on_source(source_data, projected_corners, view_size):
+    global _MB_UPDATING_PROJECTED_CORNERS
+    width, height = view_size
+    view_u = np.asarray([corner[0] for corner in projected_corners], dtype=np.float64)
+    view_v = np.asarray([corner[1] for corner in projected_corners], dtype=np.float64)
+    source_u, source_v = core.rectilinear_to_equirectangular_uv(
+        view_u,
+        view_v,
+        aspect_ratio=width / height,
+        **_panorama_projection(source_data),
+    )
+    source_corners = tuple(
+        (float(u), float(v))
+        for u, v in zip(source_u, source_v)
+    )
+
+    _MB_UPDATING_PROJECTED_CORNERS = True
+    try:
+        for property_name, corner in zip(
+            ('corner_tl', 'corner_tr', 'corner_br', 'corner_bl'),
+            source_corners,
+        ):
+            setattr(source_data, property_name, corner)
+    finally:
+        _MB_UPDATING_PROJECTED_CORNERS = False
+
+
+def _store_source_corners_on_projected_view(source_data, view_data, view_size):
+    width, height = view_size
+    source_corners = _get_overlay_corners(source_data, source_data.id_data)
+    source_u = np.asarray([corner[0] for corner in source_corners], dtype=np.float64)
+    source_v = np.asarray([corner[1] for corner in source_corners], dtype=np.float64)
+    view_u, view_v = core.equirectangular_to_rectilinear_uv(
+        source_u,
+        source_v,
+        aspect_ratio=width / height,
+        **_panorama_projection(source_data),
+    )
+    for property_name, u, v in zip(
+        ('corner_tl', 'corner_tr', 'corner_br', 'corner_bl'),
+        view_u,
+        view_v,
+    ):
+        setattr(view_data, property_name, (float(u), float(v)))
+
+
+def _overlay_corner_changed(data, context):
+    if _MB_UPDATING_PROJECTED_CORNERS or getattr(data, 'panorama_source_image', None) is not None:
+        return
+    source_image = getattr(data, 'id_data', None)
+    if source_image is not None:
+        _clear_panorama_pixel_cache(source_image)
+    data.projection_mode = 'FLAT'
+    data.panorama_heading = 0.0
+    data.panorama_elevation = 0.0
+    data.panorama_roll = 0.0
+    data.panorama_fov = np.deg2rad(60.0)
+
+
+def _center_overlay_corners(
+    data,
+    image_width,
+    image_height,
+    center=(0.5, 0.5),
+    view_size=(1.0, 1.0),
+    chart_aspect_ratio=MB_CHART_ASPECT_RATIO,
+    area_fraction=MB_CHART_AREA_FRACTION,
+):
     if image_width <= 0 or image_height <= 0:
         return
 
-    target_area = float(area_fraction) * float(image_width) * float(image_height)
+    view_width_px = abs(float(view_size[0])) * float(image_width)
+    view_height_px = abs(float(view_size[1])) * float(image_height)
+    if view_width_px <= 0 or view_height_px <= 0:
+        return
+
+    target_area = float(area_fraction) * view_width_px * view_height_px
     ratio = max(float(chart_aspect_ratio), 1e-6)
 
     chart_width_px = (target_area * ratio) ** 0.5
     chart_height_px = chart_width_px / ratio
 
-    # Keep the whole chart visible even on very wide/tall images.
-    fit_scale = min(float(image_width) / max(chart_width_px, 1e-6), float(image_height) / max(chart_height_px, 1e-6), 1.0)
+    fit_scale = min(view_width_px / max(chart_width_px, 1e-6), view_height_px / max(chart_height_px, 1e-6), 1.0)
     chart_width_px *= fit_scale
     chart_height_px *= fit_scale
 
     width_norm = chart_width_px / float(image_width)
     height_norm = chart_height_px / float(image_height)
 
-    center_x = 0.5
-    center_y = 0.5
+    center_x, center_y = center
     half_width = width_norm * 0.5
     half_height = height_norm * 0.5
 
@@ -306,6 +544,37 @@ def _center_overlay_corners(data, image_width, image_height, chart_aspect_ratio=
     data.corner_tr = (center_x + half_width, center_y + half_height)
     data.corner_br = (center_x + half_width, center_y - half_height)
     data.corner_bl = (center_x - half_width, center_y - half_height)
+
+
+def _image_editor_view_geometry(context):
+    area = getattr(context, 'area', None)
+    if area is None or area.type != 'IMAGE_EDITOR':
+        return None
+
+    window_region = next(
+        (region for region in area.regions if region.type == 'WINDOW'),
+        None,
+    )
+    if window_region is None:
+        return None
+
+    view_min = tuple(window_region.view2d.region_to_view(0, 0))
+    view_max = tuple(window_region.view2d.region_to_view(
+        window_region.width,
+        window_region.height,
+    ))
+    view_size = (
+        abs(view_max[0] - view_min[0]),
+        abs(view_max[1] - view_min[1]),
+    )
+    if view_size[0] <= 0 or view_size[1] <= 0:
+        return None
+
+    center = (
+        (view_min[0] + view_max[0]) * 0.5,
+        (view_min[1] + view_max[1]) * 0.5,
+    )
+    return center, view_size
 
 
 def _linear_to_srgb_channel(channel):
@@ -344,6 +613,12 @@ def MB_Messagebus_Init(*args):
         args=(),
         notify=MB_ImageEditor_Changed,
     )
+    bpy.msgbus.subscribe_rna(
+        key=(bpy.types.ColorManagedInputColorspaceSettings, 'name'),
+        owner=MB_MSGBUS_OWNER,
+        args=(),
+        notify=MB_ImageColorspace_Changed,
+    )
 
 
 def MB_ImageEditor_Changed():
@@ -354,8 +629,27 @@ def MB_ImageEditor_Changed():
     _tag_image_editor_redraw()
 
 
+def MB_ImageColorspace_Changed():
+    projection_views = {}
+    for image in bpy.data.images:
+        source_image = _panorama_source(image)
+        if source_image is not None:
+            source_key = int(source_image.as_pointer())
+            projection_views.setdefault(source_key, (source_image, []))[1].append(image)
+
+    for source_image, view_images in projection_views.values():
+        _clear_panorama_pixel_cache(source_image)
+        for view_image in view_images:
+            try:
+                _refresh_panorama_view(source_image, view_image)
+            except (ValueError, MemoryError, RuntimeError) as exc:
+                print(f'[MacBlend] Could not refresh panorama chart view after color-space change: {exc}')
+    _tag_image_editor_redraw()
+
+
 def MB_Messagebus_Remove():
     bpy.msgbus.clear_by_owner(MB_MSGBUS_OWNER)
+    _clear_panorama_pixel_cache()
 
 
 def _cross_triangles(length, width):
@@ -600,16 +894,6 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
         gizmo.matrix_basis[0][3] = region_point[0]
         gizmo.matrix_basis[1][3] = region_point[1]
 
-    def _offset_from_chart(self, corners, base_point, homography):
-        center = _grid_point(corners, 0.5, 0.5, homography)
-        direction = (base_point[0] - center[0], base_point[1] - center[1])
-        length = max((direction[0] ** 2 + direction[1] ** 2) ** 0.5, 1e-6)
-        scale = 0.04
-        return (
-            base_point[0] + (direction[0] / length) * scale,
-            base_point[1] + (direction[1] / length) * scale,
-        )
-
     def draw_prepare(self, context):
         if not hasattr(self, 'flip_buttons'):
             self.flip_buttons = []
@@ -677,12 +961,18 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
 
         tl, tr, br, bl = corners
 
-        horizontal_base = _lerp_2d(tl, tr, 0.5)
-        horizontal_point = self._offset_from_chart(corners, horizontal_base, homography)
+        first_row_center = _grid_point(corners, 0.5, _ccmaster_patch_uv(0)[1], homography)
+        first_column_center = _grid_point(corners, _ccmaster_patch_uv(0)[0], 0.5, homography)
+        tl_region = _region_point(context, tl)
+        tr_region = _region_point(context, tr)
+        bl_region = _region_point(context, bl)
+        first_row_region = _region_point(context, first_row_center)
+        first_column_region = _region_point(context, first_column_center)
+        horizontal_region = _opposite_line_midpoint(tl_region, tr_region, first_row_region)
+        vertical_region = _opposite_line_midpoint(tl_region, bl_region, first_column_region)
+        horizontal_point = tuple(context.region.view2d.region_to_view(*horizontal_region))
+        vertical_point = tuple(context.region.view2d.region_to_view(*vertical_region))
         self._set_flip_button(self.flip_buttons[0], context, horizontal_point, tl, tr)
-
-        vertical_base = _lerp_2d(tl, bl, 0.5)
-        vertical_point = self._offset_from_chart(corners, vertical_base, homography)
         self._set_flip_button(self.flip_buttons[1], context, vertical_point, tl, bl)
 
 
@@ -869,7 +1159,7 @@ class MB_OT_FlipOverlayVertical(bpy.types.Operator):
 class MB_OT_CenterOverlayChart(bpy.types.Operator):
     bl_idname = 'macblend.center_overlay_chart'
     bl_label = 'Center Overlay'
-    bl_description = 'Center the Macbeth chart overlay at 25% image area with a fixed 28:21 aspect ratio'
+    bl_description = 'Center the Macbeth chart overlay at 10% of the viewer area with a fixed 28:21 aspect ratio'
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -883,14 +1173,103 @@ class MB_OT_CenterOverlayChart(bpy.types.Operator):
             self.report({'ERROR'}, 'Selected image has no valid pixel resolution.')
             return {'CANCELLED'}
 
-        _center_overlay_corners(image.mb_sample_data, width, height)
+        view_geometry = _image_editor_view_geometry(context)
+        if view_geometry is None:
+            self.report({'ERROR'}, 'Could not determine the Image Editor viewer bounds.')
+            return {'CANCELLED'}
+
+        viewer_center, view_size = view_geometry
+        _center_overlay_corners(
+            image.mb_sample_data,
+            width,
+            height,
+            center=viewer_center,
+            view_size=view_size,
+        )
         _tag_image_editor_redraw()
-        self.report({'INFO'}, 'Centered overlay at 25% image area (28:21 ratio).')
+        self.report({'INFO'}, 'Centered overlay at 10% of viewer area (28:21 ratio).')
+        return {'FINISHED'}
+
+
+class MB_OT_OpenPanoramaChartView(bpy.types.Operator):
+    bl_idname = 'macblend.open_panorama_chart_view'
+    bl_label = 'Toggle Lat-Long Chart View'
+    bl_description = 'Enter or exit the undistorted lat-long chart view'
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        active_image = getattr(getattr(context, 'space_data', None), 'image', None)
+        source_image = _panorama_source(active_image)
+        if source_image is not None:
+            context.space_data.image = source_image
+            _fit_image_in_editor(context)
+            _clear_panorama_pixel_cache(source_image)
+            bpy.data.images.remove(active_image)
+            _tag_image_editor_redraw()
+            self.report({'INFO'}, f"Returned to lat-long image '{source_image.name}'.")
+            return {'FINISHED'}
+
+        source_image = active_image
+        if source_image is None or not getattr(source_image, 'mb_sample_data', None):
+            self.report({'ERROR'}, 'No panorama image is selected.')
+            return {'CANCELLED'}
+
+        source_data = source_image.mb_sample_data
+        if source_data.projection_mode != 'EQUIRECTANGULAR':
+            corners = _get_overlay_corners(source_data, source_image)
+            try:
+                heading, elevation, roll = _panorama_angles_from_overlay(
+                    corners,
+                    float(source_data.panorama_fov),
+                    MB_PANORAMA_VIEW_SIZE[0] / MB_PANORAMA_VIEW_SIZE[1],
+                )
+            except ValueError as exc:
+                self.report({'ERROR'}, f'Could not project chart alignment: {exc}')
+                return {'CANCELLED'}
+            source_data.panorama_heading = heading
+            source_data.panorama_elevation = elevation
+            source_data.panorama_roll = roll
+            source_data.projection_mode = 'EQUIRECTANGULAR'
+
+        view_image = _find_panorama_view(source_image)
+        is_new = view_image is None
+        if is_new:
+            view_image = bpy.data.images.new(
+                f'{source_image.name} - MacBlend Chart View',
+                width=MB_PANORAMA_VIEW_SIZE[0],
+                height=MB_PANORAMA_VIEW_SIZE[1],
+                alpha=True,
+                float_buffer=True,
+            )
+            view_image[MB_PANORAMA_VIEW_MARKER] = True
+            view_image.mb_sample_data.panorama_source_image = source_image
+            view_image.mb_sample_data.patch_size = int(source_data.patch_size)
+
+        try:
+            _store_source_corners_on_projected_view(
+                source_data,
+                view_image.mb_sample_data,
+                MB_PANORAMA_VIEW_SIZE,
+            )
+            _refresh_panorama_view(source_image, view_image)
+        except (ValueError, MemoryError, RuntimeError) as exc:
+            _clear_panorama_pixel_cache(source_image)
+            if is_new:
+                bpy.data.images.remove(view_image)
+            self.report({'ERROR'}, f'Could not create chart view: {exc}')
+            return {'CANCELLED'}
+
+        view_image.mb_sample_data.show_overlay = True
+        context.space_data.image = view_image
+        _fit_image_in_editor(context)
+        _tag_image_editor_redraw()
+        self.report({'INFO'}, f"{'Created' if is_new else 'Updated'} chart view for '{source_image.name}'.")
         return {'FINISHED'}
 
 
 @persistent
 def MB_Messagebus_LoadPost(*args):
+    _clear_panorama_pixel_cache()
     MB_Messagebus_Init()
     MB_ImageEditor_Changed()
 
@@ -926,10 +1305,47 @@ class MB_ImageSampleData(bpy.types.PropertyGroup):
     overlay_opacity: FloatProperty(name="Overlay Opacity", default=0.5, min=0.0, max=1.0, subtype='FACTOR')
     show_overlay: BoolProperty(name="Show Overlay", get=_get_show_overlay, set=_set_show_overlay)
     show_overlay_corners: BoolProperty(name="Corner Positions", default=False)
-    corner_tl: FloatVectorProperty(name="Top Left", size=2, default=(0.25, 0.82))
-    corner_tr: FloatVectorProperty(name="Top Right", size=2, default=(0.75, 0.82))
-    corner_br: FloatVectorProperty(name="Bottom Right", size=2, default=(0.75, 0.18))
-    corner_bl: FloatVectorProperty(name="Bottom Left", size=2, default=(0.25, 0.18))
+    corner_tl: FloatVectorProperty(name="Top Left", size=2, default=(0.25, 0.82), update=_overlay_corner_changed)
+    corner_tr: FloatVectorProperty(name="Top Right", size=2, default=(0.75, 0.82), update=_overlay_corner_changed)
+    corner_br: FloatVectorProperty(name="Bottom Right", size=2, default=(0.75, 0.18), update=_overlay_corner_changed)
+    corner_bl: FloatVectorProperty(name="Bottom Left", size=2, default=(0.25, 0.18), update=_overlay_corner_changed)
+    projection_mode: EnumProperty(
+        name="Projection",
+        items=(
+            ('FLAT', "Flat Image", "Align directly on a regular image"),
+            ('EQUIRECTANGULAR', "360° Lat-Long", "Align in an undistorted panorama chart view"),
+        ),
+        default='FLAT',
+    )
+    panorama_heading: FloatProperty(
+        name="Heading",
+        subtype='ANGLE',
+        default=0.0,
+        update=_panorama_projection_changed,
+    )
+    panorama_elevation: FloatProperty(
+        name="Elevation",
+        subtype='ANGLE',
+        default=0.0,
+        min=-np.pi * 0.5,
+        max=np.pi * 0.5,
+        update=_panorama_projection_changed,
+    )
+    panorama_roll: FloatProperty(
+        name="Roll",
+        subtype='ANGLE',
+        default=0.0,
+        update=_panorama_projection_changed,
+    )
+    panorama_fov: FloatProperty(
+        name="Field of View",
+        subtype='ANGLE',
+        default=np.deg2rad(60.0),
+        min=np.deg2rad(5.0),
+        max=np.deg2rad(140.0),
+        update=_panorama_projection_changed,
+    )
+    panorama_source_image: PointerProperty(type=bpy.types.Image)
 
 
 if not hasattr(MB_ImageSampleData, '__annotations__'):
@@ -995,6 +1411,9 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
             return {'CANCELLED'}
 
         data = image.mb_sample_data
+        source_image = _panorama_source(image)
+        storage_image = source_image or image
+        storage_data = storage_image.mb_sample_data
         overlay_corners = _get_overlay_corners(data, image)
         debug_logging = _debug_logging_enabled(context)
         if debug_logging:
@@ -1006,14 +1425,24 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
         try:
             centers = _calculate_ccmaster_patch_centers(overlay_corners)
             transfer_started = perf_counter()
-            pixel_buffer = _load_image_pixel_buffer(image)
+            pixel_buffer = _load_image_pixel_buffer(storage_image)
             transfer_seconds = perf_counter() - transfer_started
             averaging_started = perf_counter()
             sampled_values = []
             for slot, patch_name, center_x, center_y in centers:
                 x = float(center_x) * width
                 y = float(center_y) * height
-                sample_rgb = core.sample_pixel_buffer(pixel_buffer, x, y, sample_size)
+                if source_image is not None:
+                    sample_rgb = core.sample_rectilinear_patch(
+                        pixel_buffer,
+                        (width, height),
+                        x,
+                        y,
+                        sample_size,
+                        **_panorama_projection(storage_data),
+                    )
+                else:
+                    sample_rgb = core.sample_pixel_buffer(pixel_buffer, x, y, sample_size)
                 sampled_values.append((slot, patch_name, sample_rgb))
                 if debug_logging:
                     print(f"  slot[{slot}] {patch_name} -> {tuple(float(v) for v in sample_rgb)}", flush=True)
@@ -1029,12 +1458,15 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
             self.report({'ERROR'}, f"Could not sample chart: {exc}")
             return {'CANCELLED'}
 
-        _replace_sample_data(data, centers, sampled_values)
+        _replace_sample_data(storage_data, centers, sampled_values)
+        if source_image is not None:
+            storage_data.patch_size = int(data.patch_size)
+            _store_projected_corners_on_source(storage_data, overlay_corners, (width, height))
         data.show_overlay = False
         data.show_overlay_corners = False
-        _set_selected_sample_image(context.scene, image)
+        _set_selected_sample_image(context.scene, storage_image)
         _tag_image_editor_redraw()
-        self.report({'INFO'}, f"Sampled {len(data.samples)} values from '{image.name}'.")
+        self.report({'INFO'}, f"Sampled {len(storage_data.samples)} values from '{storage_image.name}'.")
         return {'FINISHED'}
 
 
@@ -1077,19 +1509,34 @@ class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        layout.template_ID(context.space_data, 'image', new='image.new', open='image.open')
         image = getattr(context.space_data, 'image', None)
         if image is None:
             layout.label(text="Select an image")
         else:
             data = image.mb_sample_data
-            layout.label(text=f"Image: {image.name}")
+            source_image = _panorama_source(image)
+            projection_data = source_image.mb_sample_data if source_image is not None else data
+            colorspace_image = source_image or image
+            layout.prop(colorspace_image.colorspace_settings, 'name', text='Color Space')
             layout.prop(data, 'patch_size')
             overlay_row = layout.row(align=True)
             overlay_row.prop(data, 'show_overlay')
             overlay_row.prop(data, 'overlay_opacity', slider=True)
+            layout.operator(
+                'macblend.open_panorama_chart_view',
+                text='Disable Lat/Long Projection' if source_image is not None else 'Lat/Long Projection',
+                icon='LOOP_BACK' if source_image is not None else 'WORLD_DATA',
+            )
 
             alignment_box = layout.box()
             alignment_box.label(text='Chart Alignment')
+            if projection_data.projection_mode == 'EQUIRECTANGULAR':
+                panorama_column = alignment_box.column(align=True)
+                panorama_column.prop(projection_data, 'panorama_heading')
+                panorama_column.prop(projection_data, 'panorama_elevation')
+                panorama_column.prop(projection_data, 'panorama_roll')
+                panorama_column.prop(projection_data, 'panorama_fov')
             alignment_box.operator('macblend.center_overlay_chart', text='Center Overlay')
             flip_row = alignment_box.row(align=True)
             flip_row.operator('macblend.flip_overlay_horizontal', text='Flip Horizontal')
@@ -1154,6 +1601,7 @@ classes = (
     MB_OT_FlipOverlayHorizontal,
     MB_OT_FlipOverlayVertical,
     MB_OT_CenterOverlayChart,
+    MB_OT_OpenPanoramaChartView,
     MB_OT_SampleImageColors,
     MB_OT_ClearSampleData,
     MB_PT_ImageEditorSamplePanel,

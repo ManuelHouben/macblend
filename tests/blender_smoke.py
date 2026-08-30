@@ -57,6 +57,43 @@ legacy_cursor_window = CursorWindow(supports_closed_hand=False)
 sampling._set_drag_cursor(legacy_cursor_window)
 assert legacy_cursor_window.cursors == ['HAND_CLOSED', 'HAND']
 
+top_left = (10.0, 80.0)
+top_right = (90.0, 60.0)
+first_row_center = (47.0, 52.0)
+horizontal_flip_point = sampling._opposite_line_midpoint(
+    top_left,
+    top_right,
+    first_row_center,
+)
+top_midpoint = np.mean((top_left, top_right), axis=0)
+top_axis = np.subtract(top_right, top_left)
+top_normal = np.asarray((-top_axis[1], top_axis[0])) / np.linalg.norm(top_axis)
+first_row_distance = np.dot(np.subtract(first_row_center, top_midpoint), top_normal)
+flip_distance = np.dot(np.subtract(horizontal_flip_point, top_midpoint), top_normal)
+np.testing.assert_allclose(
+    horizontal_flip_point,
+    top_midpoint - first_row_distance * top_normal,
+)
+np.testing.assert_allclose(flip_distance, -first_row_distance)
+
+bottom_left = (18.0, 12.0)
+first_column_center = (31.0, 43.0)
+vertical_flip_point = sampling._opposite_line_midpoint(
+    top_left,
+    bottom_left,
+    first_column_center,
+)
+left_midpoint = np.mean((top_left, bottom_left), axis=0)
+left_axis = np.subtract(bottom_left, top_left)
+left_normal = np.asarray((-left_axis[1], left_axis[0])) / np.linalg.norm(left_axis)
+first_column_distance = np.dot(np.subtract(first_column_center, left_midpoint), left_normal)
+vertical_flip_distance = np.dot(np.subtract(vertical_flip_point, left_midpoint), left_normal)
+np.testing.assert_allclose(
+    vertical_flip_point,
+    left_midpoint - first_column_distance * left_normal,
+)
+np.testing.assert_allclose(vertical_flip_distance, -first_column_distance)
+
 macblend.register()
 try:
     assert hasattr(bpy.types.Scene, 'macblend_calibrator_settings')
@@ -66,6 +103,7 @@ try:
     assert not hasattr(bpy.types, 'MACBLEND_OT_neutralize_transform')
     assert hasattr(bpy.ops.macblend, 'export_luts')
     assert hasattr(bpy.ops.macblend, 'confirm_lut_overwrite')
+    assert hasattr(bpy.ops.macblend, 'open_panorama_chart_view')
     assert hasattr(bpy.types.Scene, 'macblend_sampling_ui')
     assert not hasattr(bpy.types.Scene, 'macbeth_calibrator_settings')
     assert hasattr(bpy.types.Image, 'mb_sample_data')
@@ -74,6 +112,65 @@ try:
 
     image = bpy.data.images.new("MacBlend Sample", width=4, height=4, alpha=True, float_buffer=True)
     assert image.mb_sample_data.show_overlay_corners is False
+    assert image.mb_sample_data.projection_mode == 'FLAT'
+    viewer_center = (0.25, 0.75)
+    viewer_size = (0.8, 0.6)
+    fake_window_region = type(
+        "WindowRegion",
+        (),
+        {
+            "type": 'WINDOW',
+            "width": 800,
+            "height": 600,
+            "view2d": type(
+                "View2D",
+                (),
+                {
+                    "region_to_view": lambda self, x, y: (
+                        viewer_center[0] + (x / 800.0 - 0.5) * viewer_size[0],
+                        viewer_center[1] + (y / 600.0 - 0.5) * viewer_size[1],
+                    ),
+                },
+            )(),
+        },
+    )()
+    fake_context = type(
+        "ImageEditorContext",
+        (),
+        {
+            "area": type("ImageEditorArea", (), {"type": 'IMAGE_EDITOR', "regions": [fake_window_region]})(),
+            "space_data": type("ImageEditorSpace", (), {"image": image})(),
+        },
+    )()
+    center_reports = []
+    center_operator = type(
+        "CenterReporter",
+        (),
+        {"report": lambda self, levels, message: center_reports.append((levels, message))},
+    )()
+    assert sampling.MB_OT_CenterOverlayChart.execute(center_operator, fake_context) == {'FINISHED'}
+    centered_corners = sampling._get_overlay_corners(image.mb_sample_data, image)
+    np.testing.assert_allclose(
+        np.mean(np.asarray(centered_corners), axis=0),
+        viewer_center,
+    )
+    chart_width_px = (centered_corners[1][0] - centered_corners[0][0]) * image.size[0]
+    chart_height_px = (centered_corners[0][1] - centered_corners[3][1]) * image.size[1]
+    viewer_area_px = (
+        viewer_size[0] * image.size[0]
+        * viewer_size[1] * image.size[1]
+    )
+    np.testing.assert_allclose(
+        chart_width_px * chart_height_px / viewer_area_px,
+        sampling.MB_CHART_AREA_FRACTION,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        chart_width_px / chart_height_px,
+        sampling.MB_CHART_ASPECT_RATIO,
+        atol=1e-6,
+    )
+    assert center_reports[-1][0] == {'INFO'}
     incomplete_image = bpy.data.images.new("MacBlend Incomplete", width=1, height=1)
     incomplete_image.mb_sample_data.samples.add().patch_index = 0
     assert not sampling.image_has_sample_values(incomplete_image)
@@ -198,6 +295,181 @@ try:
         sampling.core.sample_pixel_buffer(pixel_buffer, 0, 0, 3),
         np.mean(pixels[0:2, 0:2, :3], axis=(0, 1), dtype=np.float64),
     )
+
+    panorama = bpy.data.images.new("MacBlend Panorama", width=8, height=4, alpha=True, float_buffer=True)
+    panorama_pixels = np.zeros((4, 8, 4), dtype=np.float32)
+    panorama_pixels[..., 0] = np.linspace(0.0, 1.0, 8)
+    panorama_pixels[..., 2] = np.linspace(1.0, 0.0, 8)
+    panorama_pixels[..., 3] = 1.0
+    panorama.pixels.foreach_set(panorama_pixels.ravel())
+    panorama.mb_sample_data.corner_tl = (0.94, 0.72)
+    panorama.mb_sample_data.corner_tr = (0.06, 0.62)
+    panorama.mb_sample_data.corner_br = (0.07, 0.34)
+    panorama.mb_sample_data.corner_bl = (0.95, 0.40)
+
+    panorama_space = type("PanoramaSpace", (), {"image": panorama})()
+    panorama_context = type(
+        "PanoramaContext",
+        (),
+        {
+            "space_data": panorama_space,
+            "scene": bpy.context.scene,
+            "preferences": bpy.context.preferences,
+        },
+    )()
+    panorama_reports = []
+    panorama_operator = type(
+        "PanoramaReporter",
+        (),
+        {"report": lambda self, levels, message: panorama_reports.append((levels, message))},
+    )()
+    assert sampling.MB_OT_OpenPanoramaChartView.execute(panorama_operator, panorama_context) == {'FINISHED'}
+    assert panorama.mb_sample_data.projection_mode == 'EQUIRECTANGULAR'
+    assert abs(panorama.mb_sample_data.panorama_heading) > np.deg2rad(170.0)
+    assert not np.isclose(panorama.mb_sample_data.panorama_roll, 0.0, atol=1e-6)
+    chart_view = panorama_space.image
+    assert chart_view.get(sampling.MB_PANORAMA_VIEW_MARKER)
+    assert chart_view.mb_sample_data.panorama_source_image == panorama
+    assert tuple(chart_view.size) == sampling.MB_PANORAMA_VIEW_SIZE
+    expected_view_u, expected_view_v = sampling.core.equirectangular_to_rectilinear_uv(
+        np.asarray((0.94, 0.06, 0.07, 0.95)),
+        np.asarray((0.72, 0.62, 0.34, 0.40)),
+        aspect_ratio=chart_view.size[0] / chart_view.size[1],
+        **sampling._panorama_projection(panorama.mb_sample_data),
+    )
+    np.testing.assert_allclose(
+        sampling._get_overlay_corners(chart_view.mb_sample_data, chart_view),
+        tuple(zip(expected_view_u, expected_view_v)),
+        atol=1e-6,
+    )
+    source_homography = sampling.core.build_chart_homography(
+        ((0.94, 0.72), (1.06, 0.62), (1.07, 0.34), (0.95, 0.40))
+    )
+    source_middle_left = sampling.core.map_chart_point(source_homography, 0.0, 0.5)
+    source_middle_right = sampling.core.map_chart_point(source_homography, 1.0, 0.5)
+    projected_middle_u, projected_middle_v = sampling.core.equirectangular_to_rectilinear_uv(
+        np.mod((source_middle_left[0], source_middle_right[0]), 1.0),
+        (source_middle_left[1], source_middle_right[1]),
+        aspect_ratio=chart_view.size[0] / chart_view.size[1],
+        **sampling._panorama_projection(panorama.mb_sample_data),
+    )
+    assert projected_middle_u[0] < projected_middle_u[1]
+    np.testing.assert_allclose(
+        projected_middle_v,
+        (0.5, 0.5),
+        atol=1e-6,
+    )
+    panorama_cache_key = int(panorama.as_pointer())
+    cached_panorama_pixels = sampling._MB_PANORAMA_PIXEL_CACHE[panorama_cache_key][1]
+    initial_view_center = np.asarray(chart_view.pixels[4 * ((384 * 1024) + 512):4 * ((384 * 1024) + 512) + 3])
+    changed_panorama_pixels = panorama_pixels.copy()
+    changed_panorama_pixels[..., 0] *= 0.5
+    changed_panorama_pixels[..., 2] *= 0.75
+    panorama.pixels.foreach_set(changed_panorama_pixels.ravel())
+    sampling.MB_ImageColorspace_Changed()
+    refreshed_panorama_pixels = sampling._MB_PANORAMA_PIXEL_CACHE[panorama_cache_key][1]
+    assert refreshed_panorama_pixels is not cached_panorama_pixels
+    colorspace_refreshed_center = np.asarray(
+        chart_view.pixels[4 * ((384 * 1024) + 512):4 * ((384 * 1024) + 512) + 3]
+    )
+    assert not np.allclose(initial_view_center, colorspace_refreshed_center)
+    cached_panorama_pixels = refreshed_panorama_pixels
+    initial_view_center = colorspace_refreshed_center
+    stored_projection = (0.7, -0.2, 0.1, np.deg2rad(75.0))
+    panorama.mb_sample_data.panorama_heading = stored_projection[0]
+    panorama.mb_sample_data.panorama_elevation = stored_projection[1]
+    panorama.mb_sample_data.panorama_roll = stored_projection[2]
+    panorama.mb_sample_data.panorama_fov = stored_projection[3]
+    assert sampling._MB_PANORAMA_PIXEL_CACHE[panorama_cache_key][1] is cached_panorama_pixels
+    refreshed_view_center = np.asarray(chart_view.pixels[4 * ((384 * 1024) + 512):4 * ((384 * 1024) + 512) + 3])
+    assert not np.allclose(initial_view_center, refreshed_view_center)
+    projected_corners = sampling._get_overlay_corners(chart_view.mb_sample_data, chart_view)
+    expected_source_u, expected_source_v = sampling.core.rectilinear_to_equirectangular_uv(
+        np.asarray([corner[0] for corner in projected_corners]),
+        np.asarray([corner[1] for corner in projected_corners]),
+        aspect_ratio=chart_view.size[0] / chart_view.size[1],
+        **sampling._panorama_projection(panorama.mb_sample_data),
+    )
+    chart_view.mb_sample_data.patch_size = 1
+    assert sampling.MB_OT_SampleImageColors.execute(panorama_operator, panorama_context) == {'FINISHED'}
+    assert sampling.image_has_sample_values(panorama)
+    assert not sampling.image_has_sample_values(chart_view)
+    assert panorama.mb_sample_data.patch_size == 1
+    np.testing.assert_allclose(
+        sampling._get_overlay_corners(panorama.mb_sample_data, panorama),
+        tuple(zip(expected_source_u, expected_source_v)),
+        atol=1e-6,
+    )
+    assert panorama.mb_sample_data.projection_mode == 'EQUIRECTANGULAR'
+    np.testing.assert_allclose(
+        (
+            panorama.mb_sample_data.panorama_heading,
+            panorama.mb_sample_data.panorama_elevation,
+            panorama.mb_sample_data.panorama_roll,
+            panorama.mb_sample_data.panorama_fov,
+        ),
+        stored_projection,
+    )
+    chart_view_name = chart_view.name
+    assert sampling.MB_OT_OpenPanoramaChartView.execute(panorama_operator, panorama_context) == {'FINISHED'}
+    assert panorama_space.image == panorama
+    assert bpy.data.images.get(chart_view_name) is None
+    assert panorama_cache_key not in sampling._MB_PANORAMA_PIXEL_CACHE
+    assert sampling.MB_OT_OpenPanoramaChartView.execute(panorama_operator, panorama_context) == {'FINISHED'}
+    chart_view = panorama_space.image
+    assert chart_view.get(sampling.MB_PANORAMA_VIEW_MARKER)
+    assert chart_view.mb_sample_data.patch_size == 1
+    np.testing.assert_allclose(
+        sampling._get_overlay_corners(chart_view.mb_sample_data, chart_view),
+        projected_corners,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        (
+            panorama.mb_sample_data.panorama_heading,
+            panorama.mb_sample_data.panorama_elevation,
+            panorama.mb_sample_data.panorama_roll,
+            panorama.mb_sample_data.panorama_fov,
+        ),
+        stored_projection,
+    )
+    chart_view_name = chart_view.name
+    assert sampling.MB_OT_OpenPanoramaChartView.execute(panorama_operator, panorama_context) == {'FINISHED'}
+    assert panorama_space.image == panorama
+    assert bpy.data.images.get(chart_view_name) is None
+    panorama.mb_sample_data.corner_tl = (0.3, 0.7)
+    panorama.mb_sample_data.corner_tr = (0.7, 0.7)
+    panorama.mb_sample_data.corner_br = (0.7, 0.3)
+    panorama.mb_sample_data.corner_bl = (0.3, 0.3)
+    assert panorama.mb_sample_data.projection_mode == 'FLAT'
+    np.testing.assert_allclose(
+        (
+            panorama.mb_sample_data.panorama_heading,
+            panorama.mb_sample_data.panorama_elevation,
+            panorama.mb_sample_data.panorama_roll,
+            panorama.mb_sample_data.panorama_fov,
+        ),
+        (0.0, 0.0, 0.0, np.deg2rad(60.0)),
+    )
+    assert sampling.MB_OT_OpenPanoramaChartView.execute(panorama_operator, panorama_context) == {'FINISHED'}
+    chart_view = panorama_space.image
+    assert chart_view.get(sampling.MB_PANORAMA_VIEW_MARKER)
+    np.testing.assert_allclose(
+        (
+            panorama.mb_sample_data.panorama_heading,
+            panorama.mb_sample_data.panorama_elevation,
+            panorama.mb_sample_data.panorama_roll,
+            panorama.mb_sample_data.panorama_fov,
+        ),
+        (0.0, 0.0, 0.0, np.deg2rad(60.0)),
+        atol=1e-6,
+    )
+    chart_view_name = chart_view.name
+    assert sampling.MB_OT_OpenPanoramaChartView.execute(panorama_operator, panorama_context) == {'FINISHED'}
+    assert panorama_space.image == panorama
+    assert bpy.data.images.get(chart_view_name) is None
+    sampling._set_selected_sample_image(bpy.context.scene, None)
+    bpy.data.images.remove(panorama)
 
     unowned_group = bpy.data.node_groups.new("MB ColorMatrix (Shader)", "ShaderNodeTree")
     shader_group = calibration.build_matrix_node_group('SHADER')
