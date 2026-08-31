@@ -597,7 +597,7 @@ def _get_show_overlay(data):
     stored_value = data.get('show_overlay')
     if stored_value is not None:
         return bool(stored_value)
-    return getattr(data.id_data, 'source', None) != 'VIEWER'
+    return False
 
 
 def _set_show_overlay(data, value):
@@ -1305,6 +1305,7 @@ class MB_ImageSampleData(bpy.types.PropertyGroup):
     overlay_opacity: FloatProperty(name="Overlay Opacity", default=0.5, min=0.0, max=1.0, subtype='FACTOR')
     show_overlay: BoolProperty(name="Show Overlay", get=_get_show_overlay, set=_set_show_overlay)
     show_overlay_corners: BoolProperty(name="Corner Positions", default=False)
+    show_projection_settings: BoolProperty(name="Projection Settings", default=False)
     corner_tl: FloatVectorProperty(name="Top Left", size=2, default=(0.25, 0.82), update=_overlay_corner_changed)
     corner_tr: FloatVectorProperty(name="Top Right", size=2, default=(0.75, 0.82), update=_overlay_corner_changed)
     corner_br: FloatVectorProperty(name="Bottom Right", size=2, default=(0.75, 0.18), update=_overlay_corner_changed)
@@ -1531,16 +1532,29 @@ class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
 
             alignment_box = layout.box()
             alignment_box.label(text='Chart Alignment')
-            if projection_data.projection_mode == 'EQUIRECTANGULAR':
-                panorama_column = alignment_box.column(align=True)
-                panorama_column.prop(projection_data, 'panorama_heading')
-                panorama_column.prop(projection_data, 'panorama_elevation')
-                panorama_column.prop(projection_data, 'panorama_roll')
-                panorama_column.prop(projection_data, 'panorama_fov')
-            alignment_box.operator('macblend.center_overlay_chart', text='Center Overlay')
+            center_row = alignment_box.row()
+            center_row.scale_y = 1.6
+            center_row.operator('macblend.center_overlay_chart', text='Center Overlay')
             flip_row = alignment_box.row(align=True)
             flip_row.operator('macblend.flip_overlay_horizontal', text='Flip Horizontal')
             flip_row.operator('macblend.flip_overlay_vertical', text='Flip Vertical')
+
+            if projection_data.projection_mode == 'EQUIRECTANGULAR':
+                projection_header = alignment_box.row(align=True)
+                projection_icon = 'TRIA_DOWN' if projection_data.show_projection_settings else 'TRIA_RIGHT'
+                projection_header.prop(
+                    projection_data,
+                    'show_projection_settings',
+                    text='Projection Settings',
+                    icon=projection_icon,
+                    emboss=False,
+                )
+                if projection_data.show_projection_settings:
+                    panorama_column = alignment_box.column(align=True)
+                    panorama_column.prop(projection_data, 'panorama_heading')
+                    panorama_column.prop(projection_data, 'panorama_elevation')
+                    panorama_column.prop(projection_data, 'panorama_roll')
+                    panorama_column.prop(projection_data, 'panorama_fov')
 
             corners_header = alignment_box.row(align=True)
             corners_icon = 'TRIA_DOWN' if data.show_overlay_corners else 'TRIA_RIGHT'

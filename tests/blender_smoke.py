@@ -112,6 +112,7 @@ try:
 
     image = bpy.data.images.new("MacBlend Sample", width=4, height=4, alpha=True, float_buffer=True)
     assert image.mb_sample_data.show_overlay_corners is False
+    assert image.mb_sample_data.show_projection_settings is False
     assert image.mb_sample_data.projection_mode == 'FLAT'
     viewer_center = (0.25, 0.75)
     viewer_size = (0.8, 0.6)
@@ -276,7 +277,7 @@ try:
     assert settings.sample_target_image is None
 
     assert image.mb_sample_data.get('show_overlay') is None
-    assert image.mb_sample_data.show_overlay is True
+    assert image.mb_sample_data.show_overlay is False
     assert image.mb_sample_data.get('show_overlay') is None
     image.mb_sample_data.show_overlay = False
     assert image.mb_sample_data.get('show_overlay') is False

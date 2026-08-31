@@ -1,7 +1,7 @@
 project = "MacBlend"
 copyright = "2024-2026, Manuel Houben"
 author = "Manuel Houben"
-release = "2.1.0"
+release = "2.2.1"
 
 extensions = [
     "sphinx.ext.mathjax",
