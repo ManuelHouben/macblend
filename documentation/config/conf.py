@@ -28,12 +28,12 @@ html_theme_options = {
     "source_directory": "documentation/pages/",
     "navigation_with_keys": True,
     "light_css_variables": {
-        "color-brand-primary": "#176b66",
-        "color-brand-content": "#176b66",
+        "color-brand-primary": "#265787",
+        "color-brand-content": "#265787",
     },
     "dark_css_variables": {
-        "color-brand-primary": "#63c7be",
-        "color-brand-content": "#63c7be",
+        "color-brand-primary": "#8cb4ff",
+        "color-brand-content": "#8cb4ff",
     },
 }
 

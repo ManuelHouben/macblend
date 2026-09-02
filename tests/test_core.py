@@ -138,6 +138,44 @@ class HomographyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             core.build_chart_homography(((0, 1), (1, 0), (1, 1), (0, 0)))
 
+    def test_rectified_size_uses_image_pixels_and_opposing_edges(self):
+        corners = ((0.1, 0.9), (0.9, 0.8), (0.7, 0.2), (0.2, 0.1))
+        size = core.chart_rectified_size(corners, (1000, 500))
+        points = np.asarray(corners) * (1000, 500)
+        edges = np.linalg.norm(np.roll(points, -1, axis=0) - points, axis=1)
+
+        np.testing.assert_allclose(size, ((edges[0] + edges[2]) / 2, (edges[1] + edges[3]) / 2))
+
+    def test_patch_size_is_eighty_percent_of_smallest_cell(self):
+        self.assertEqual(core.chart_patch_size((300, 200)), 40)
+        self.assertEqual(core.chart_patch_size((600, 320)), 64)
+        self.assertEqual(core.chart_patch_size((3000, 2000)), 200)
+
+    def test_effective_patch_size_clamps_small_images(self):
+        self.assertEqual(core.effective_patch_size(40, (24, 16)), 24)
+        self.assertEqual(core.effective_patch_size(40, (100, 100)), 40)
+
+    def test_patch_footprint_follows_perspective(self):
+        corners = ((0.1, 0.9), (0.9, 0.7), (0.7, 0.1), (0.2, 0.2))
+        transform = core.build_chart_homography(corners)
+        footprint = core.chart_patch_footprint(transform, 0, 50)
+
+        self.assertEqual(footprint.shape, (4, 2))
+        self.assertFalse(np.isclose(footprint[0, 1], footprint[1, 1]))
+        self.assertFalse(np.isclose(footprint[1, 0], footprint[2, 0]))
+
+    def test_warped_sampling_matches_identity_chart_raster(self):
+        width, height = core.CHART_SIZE
+        image_u = (np.arange(width, dtype=np.float32) + 0.5) / width
+        image_v = (np.arange(height, dtype=np.float32) + 0.5) / height
+        grid_u, grid_v = np.meshgrid(image_u, image_v)
+        pixels = np.stack((grid_u, grid_v, grid_u + grid_v), axis=-1)
+        transform = core.build_chart_homography(((0, 1), (1, 1), (1, 0), (0, 0)))
+
+        sample = core.sample_warped_chart_patch(pixels, transform, 0, 50)
+
+        np.testing.assert_allclose(sample, (*core.chart_patch_uv(0), sum(core.chart_patch_uv(0))), atol=1e-6)
+
 
 class MatrixTests(unittest.TestCase):
     def test_identity_samples_produce_identity_matrix(self):
@@ -145,6 +183,7 @@ class MatrixTests(unittest.TestCase):
         result = core.calculate_matrix_result(samples, samples)
         np.testing.assert_allclose(result.matrix, np.eye(3), atol=1e-6)
         self.assertEqual(result.rank, 3)
+        self.assertEqual(result.transform_condition_number, 1.0)
 
     def test_rank_deficient_samples_are_rejected(self):
         samples = np.ones((24, 3), dtype=np.float32)
@@ -157,6 +196,41 @@ class MatrixTests(unittest.TestCase):
         singular_target[:, 2] = 0.0
         with self.assertRaises(core.CalibrationError):
             core.calculate_matrix_result(samples, singular_target)
+
+
+class ReferenceValueTests(unittest.TestCase):
+    def test_fixed_gamut_registry_has_expected_order(self):
+        self.assertEqual(
+            [identifier for identifier, _label, _matrix in core.REFERENCE_GAMUTS],
+            [
+                'ACES', 'ACESCG', 'P3D65', 'REC2020', 'REC709',
+                'ARRI_WIDE_GAMUT_3', 'ARRI_WIDE_GAMUT_4', 'RED_WIDE_GAMUT_RGB',
+                'SONY_SGAMUT3', 'SONY_SGAMUT3_CINE', 'PANASONIC_V_GAMUT',
+                'BLACKMAGIC_WIDE_GAMUT', 'FILMLIGHT_E_GAMUT', 'DAVINCI_WIDE_GAMUT',
+            ],
+        )
+
+    def test_rec709_reference_matches_expected_pipeline_without_clipping(self):
+        reference = core.build_reference_values('REC709')
+        independently_adapted = np.dot(
+            core.MACBETH_XYZ_D50,
+            core.MACBETH_D50_TO_D65_CAT02.T,
+        )
+        expected = np.dot(
+            independently_adapted,
+            np.array((
+                (3.240969942, -1.537383178, -0.4986107603),
+                (-0.9692436363, 1.875967502, 0.04155505741),
+                (0.0556300797, -0.2039769589, 1.056971514),
+            )).T,
+        )
+
+        np.testing.assert_allclose(reference, expected, rtol=0.0, atol=1e-12)
+        self.assertLess(reference[17, 0], 0.0)
+
+    def test_unknown_gamut_is_rejected(self):
+        with self.assertRaises(ValueError):
+            core.build_reference_values('LINEAR_SRGB_D65')
 
 
 if __name__ == "__main__":

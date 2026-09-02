@@ -6,8 +6,6 @@ Calibrate images containing a Macbeth ColorChecker directly in Blender.
 
 MacBlend samples chart patches, calculates forward and inverse color transforms, creates compositor or shader nodes, and exports the results as `.cube` LUTs. It calculates the $3 \times 3$ matrix that best conforms the sampled input to a specified color-space gamut or to a chart sampled from another image.
 
-MacBlend adapts the workflows documented by Marco Meyer for [mmColorTarget](https://www.marcomeyer-vfx.de/posts/mmcolortarget-nuke-gizmo/) and Jed Smith for [CalibrateMacbeth](https://gist.github.com/jedypod/798b365ea64e8121999e7036ae7e0217). Those references are important background for the method and its limitations.
-
 ## Requirements
 
 - Blender 4.2 or newer
@@ -15,7 +13,7 @@ MacBlend adapts the workflows documented by Marco Meyer for [mmColorTarget](http
 - Scene-linear source and target data
 - Correct image input transforms (IDTs) in Blender
 
-The image [**Color Space**](https://docs.blender.org/manual/en/4.2/editors/image/image_settings.html#bpy-types-colormanagedinputcolorspacesettings-name) setting in the [Image Editor](https://docs.blender.org/manual/en/4.2/editors/image/index.html) sidebar must describe the image encoding. When **Use reference values as target** is enabled, choose the gamut in which the source was recorded, such as **V-Gamut** for a Panasonic V-Gamut image.
+The image [**Color Space**](https://docs.blender.org/manual/en/4.2/editors/image/image_settings.html#bpy-types-colormanagedinputcolorspacesettings-name) setting in the [Image Editor](https://docs.blender.org/manual/en/4.2/editors/image/index.html) sidebar must describe the image encoding. When **Use reference values as target** is enabled, the target gamut must match Blender's scene-linear working gamut after that input transform. MacBlend auto-detects supported working gamuts when a calibration source image is selected and shows the detection status below the target selector. When no explicit alias matches, it reports the failure and keeps **Linear Rec. 709** selected as a manually overridable fallback.
 
 ## Tutorial
 
@@ -33,9 +31,9 @@ To use the second sampled image as the target, disable **Use reference values as
 
 ## Method and limitations
 
-MacBlend averages the RGB values inside all 24 chart patches and uses a least-squares fit to calculate one $3 \times 3$ matrix. Optional normalization uses the Neutral 5 patch to separate a global exposure scale from the matrix.
+MacBlend perspective-warps each patch footprint from rectified chart space, averages its RGB values, and uses a least-squares fit across all 24 patches to calculate one $3 \times 3$ matrix. Optional normalization uses the Neutral 5 patch to separate a global exposure scale from the matrix.
 
-This is a linear approximation, not a general color grade or full camera characterization. It cannot reproduce gamma changes, tone curves, clipping, local adjustments, or hue-selective corrections. Both reference tools stress that results are most reliable with scene-linear, minimally processed, evenly exposed material. Built-in chart values are based on D65; substantial differences between the capture illuminant and D65 can increase error.
+This is a linear approximation, not a general color grade or full camera characterization. It cannot reproduce gamma changes, tone curves, clipping, local adjustments, or hue-selective corrections. Results are most reliable with scene-linear, minimally processed, evenly exposed material. Built-in chart values are based on D65; substantial differences between the capture illuminant and D65 can increase error.
 
 ## Installation
 
@@ -56,22 +54,10 @@ The user manual is available at [manuelhouben.github.io/macblend](https://manuel
 
 Report bugs through the [issue tracker](https://github.com/ManuelHouben/macblend/issues). Include the Blender and MacBlend versions, image color-space settings, and reproduction steps.
 
-## Development
-
-Run the Python unit tests from the repository root:
-
-```console
-python -m unittest discover -s tests -p "test_*.py"
-```
-
-Validate and build the extension from its package directory:
-
-```console
-cd source
-blender --command extension validate
-blender --command extension build --output-dir ../dist
-```
-
 ## License
 
-MacBlend is licensed under the [GNU General Public License v3.0 or later](LICENSE). Third-party acknowledgements are listed in [source/THIRD_PARTY_NOTICES.md](source/THIRD_PARTY_NOTICES.md).
+MacBlend is licensed under the [GNU General Public License v3.0 or later](LICENSE).
+
+## Acknowledgements
+
+MacBlend owes much to Marco Meyer's [mmColorTarget](https://www.marcomeyer-vfx.de/posts/mmcolortarget-nuke-gizmo/), Jed Smith's [CalibrateMacbeth](https://gist.github.com/jedypod/798b365ea64e8121999e7036ae7e0217), and Paul Schlichter's Colour Chart Camera Matcher add-on.

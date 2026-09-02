@@ -1,42 +1,53 @@
-# Method and limitations
+# Method and Limitations
 
-MacBlend adapts the chart-matching workflow used by Marco Meyer's [mmColorTarget](https://www.marcomeyer-vfx.de/posts/mmcolortarget-nuke-gizmo/) and Jed Smith's [CalibrateMacbeth](https://gist.github.com/jedypod/798b365ea64e8121999e7036ae7e0217).
+## Color Management
 
-## Before you start
+The image [**Color Space**](https://docs.blender.org/manual/en/latest/editors/image/image_settings.html#bpy-types-colormanagedinputcolorspacesettings-name) is its input transform, often called an IDT. It converts stored values into the scene-linear working values used by the calibration. For example, Panasonic V-Log/V-Gamut footage requires the corresponding input transform from Blender's active color configuration.
 
-In the [Image Editor](https://docs.blender.org/manual/en/4.2/editors/image/index.html) sidebar, [**Color Space**](https://docs.blender.org/manual/en/4.2/editors/image/image_settings.html#bpy-types-colormanagedinputcolorspacesettings-name) selects the image input transform, often called an IDT. It turns the file's stored values into the scene-linear working values required by the calculation. For example, Panasonic V-Log/V-Gamut footage should use the matching Panasonic input transform available in your Blender color configuration.
+The [display transform](https://docs.blender.org/manual/en/latest/render/color_management.html#display-transforms) changes the preview without changing sampled values. **Non-Color** bypasses input conversion and is only appropriate for data intentionally encoded that way.
 
-[Find out more about color spaces and transforms in Blender.](https://docs.blender.org/manual/en/latest/render/color_management/color_spaces.html)
+See [Color Spaces](https://docs.blender.org/manual/en/latest/render/color_management/color_spaces.html) in the Blender Manual.
 
-The [display/view transform](https://docs.blender.org/manual/en/4.2/render/color_management.html#display-transforms) changes how the image looks on screen. It does not change the values MacBlend samples. Do not choose [**Non-Color**](https://docs.blender.org/manual/en/4.2/render/color_management.html#image-color-spaces) just to change the preview; use it only when the image data is deliberately meant to bypass color conversion.
+## Sampling Model
 
-When **Use reference values as target** is enabled, choose the gamut in which the source was recorded. For example, use **V-Gamut** for a Panasonic V-Gamut image. This tells MacBlend which known chart values to compare against. It does not select a creative look or delivery color space.
+**Patch Size** determines how large the ColorChecker overlay is drawn. A value of 40 results in patches that are 40 × 40 pixels. Moving the corners introduces perspective, so the visible patch sizes change with the shape of the chart.
 
-## What happens when you sample
+## Target Data
 
-First, align the four overlay corners with the four corners of the chart. MacBlend then finds the center of every patch and averages a small square of pixels there. Keep that square inside the colored part of a patch, away from borders, glare, shadows, and reflections.
+The target can be another sampled chart or MacBlend's built-in ColorChecker values. The built-in values are based on published [ColorChecker reference data](https://colour.readthedocs.io/en/develop/generated/colour.CCS_COLOURCHECKERS.html).
 
-You can either sample a second chart image as the target, useful for matching camera A to camera B, or use MacBlend's built-in chart references. The built-in references start from D65 values and are converted for the recorded gamut you choose.
+With **Use reference values as target** enabled, **Target Gamut** converts those reference values to the selected linear color space. MacBlend initially matches Blender's **File Color Space** setting when possible; see Blender's [Color Management](https://docs.blender.org/manual/en/latest/render/color_management.html) documentation. If no match is found, MacBlend reports the problem and uses **Linear Rec. 709** as a fallback.
 
-## What Forward and Inverse mean
+```{note}
+For use in the current scene, **Target Gamut** should match the gamut selected under **File Color Space**.
+```
 
-**Forward** moves the sampled source toward the selected target. **Inverse** moves data from the selected target back toward the sampled source. Both directions are written when you export LUTs.
+## Transform Direction
 
-**Normalize** handles a broad brightness difference before the color correction is calculated. **Create Exposure Node** keeps that brightness adjustment visible as its own node after the color transform. Leave it enabled when you want to inspect or adjust that exposure change separately.
+**Forward**
+: Transforms the sampled source toward the target.
 
-## What it cannot do
+**Inverse**
+: Transforms the target back toward the sampled source.
 
-A single color correction cannot fix everything. It will not reliably repair gamma errors, display rendering, clipped highlights, a local grade, a selective hue adjustment, uneven lighting, glare, shadows, or a damaged chart.
+LUT exports contain both directions.
 
-Use a clean, evenly lit, properly exposed chart and minimally processed imagery. The built-in chart references assume D65 conditions, so unusual lighting can make a reference-based result less accurate. Always check the transformed chart and representative shot content before relying on the result.
+## Normalization
 
-## Learn more
+**Normalize** separates a broad brightness difference before fitting the color matrix. The Neutral 5 patch and Rec. 709 luminance coefficients determine the scale.
 
-These resources continue from approachable introductions through practical guidance to technical background and the original Nuke implementations:
+**Create Exposure Node** represents that scale as an adjustable node after the matrix.
+
+## Limitations
+
+A single RGB matrix cannot reliably repair an incorrect gamma, display rendering, clipped channels, local or selective grading, uneven lighting, glare, shadows, or chart damage. Built-in references assume D65 conditions; unusual illumination reduces the accuracy of a reference-based result.
+
+```{important}
+Check the result on both the chart and the rest of the image. Even when MacBlend completes the calculation, poor lighting, glare, clipped colors, or an incorrect image **Color Space** can produce a bad result.
+```
+
+## See Also
 
 - [Hitchhiker's Guide to Digital Colour](https://hg2dc.com/)
 - Chris Brejon, [CG Cinematography](https://chrisbrejon.com/cg-cinematography/)
 - [ACES Overview](https://docs.acescentral.com/background/overview/)
-- Marco Meyer, [mmColorTarget - Nuke Gizmo](https://www.marcomeyer-vfx.de/posts/mmcolortarget-nuke-gizmo/)
-- Jed Smith, [CalibrateMacbeth](https://gist.github.com/jedypod/798b365ea64e8121999e7036ae7e0217)
-- Colour Developers, [Colour-Nuke](https://github.com/colour-science/colour-nuke), the source of the bundled color-space transform data

@@ -1,8 +1,8 @@
 # Introduction
 
-Think of a Macbeth ColorChecker as a known set of paint swatches. MacBlend compares all 24 swatches in your image with a target, then builds one broad correction that brings them closer. It can create the correction as compositor or shader nodes and export it in both directions as `.cube` LUTs.
+MacBlend calibrates images from a photographed Macbeth ColorChecker. It compares the chart's 24 measured patches with reference values or a second sampled chart, then fits a single RGB matrix that brings the source closer to the target.
 
-It brings the chart-matching workflows documented by Marco Meyer in [mmColorTarget](https://www.marcomeyer-vfx.de/posts/mmcolortarget-nuke-gizmo/) and Jed Smith in [CalibrateMacbeth](https://gist.github.com/jedypod/798b365ea64e8121999e7036ae7e0217) into Blender.
+The transform can be created as compositor or shader nodes, or exported in both directions as `.cube` LUTs.
 
 ## Requirements
 
@@ -12,26 +12,47 @@ It brings the chart-matching workflows documented by Marco Meyer in [mmColorTarg
 
 ## Installation
 
-Install MacBlend from the [Blender Extensions platform](https://extensions.blender.org/add-ons/macblend/).
+MacBlend is available from the [Blender Extensions platform](https://extensions.blender.org/add-ons/macblend/). Release archives are also published on [GitHub](https://github.com/ManuelHouben/macblend/releases).
 
-When the Extensions platform is unavailable, download an extension ZIP from [GitHub releases](https://github.com/ManuelHouben/macblend/releases).
+See [Installing Extensions](https://docs.blender.org/manual/en/latest/editors/preferences/extensions.html#installing-extensions) in the Blender Manual.
 
-See Blender's [Installing Extensions](https://docs.blender.org/manual/en/4.2/editors/preferences/extensions.html#installing-extensions) documentation for installation instructions.
+## Preferences
 
-MacBlend adds a **MacBlend** tab to the [Image Editor](https://docs.blender.org/manual/en/4.2/editors/image/index.html) sidebar and to the sidebar of supported [Compositor](https://docs.blender.org/manual/en/4.2/editors/compositor.html) and [Shader Editor](https://docs.blender.org/manual/en/4.2/editors/shader_editor.html) node editors.
+Open **Edit > Preferences > Add-ons > MacBlend** to configure the initial values used by MacBlend. Patch Size and Overlay Opacity apply to new image sampling data. Normalization and Exposure Node Creation apply to new calibration settings. LUT Size and LUT Clamping initialize the options shown each time the LUT export browser opens.
+
+Changing a default does not replace a value already customized on an image or scene.
+
+## Editors
+
+MacBlend adds a sidebar tab to the following editors:
+
+[Image Editor](https://docs.blender.org/manual/en/latest/editors/image/index.html)
+: Chart alignment, sampling, and the list of sampled images.
+
+[Compositor](https://docs.blender.org/manual/en/latest/editors/compositor.html)
+: Calibration nodes and LUT export.
+
+[Shader Editor](https://docs.blender.org/manual/en/latest/editors/shader_editor.html)
+: Calibration nodes and LUT export.
 
 ## Color management
 
-Color management tells Blender how to interpret the RGB values in an image. Set the image's [**Color Space**](https://docs.blender.org/manual/en/latest/glossary/index.html#term-Color-Space) to match how it was recorded or exported so MacBlend receives the right colors; if Blender starts with the wrong colors, the correction will also be wrong.
+The image [**Color Space**](https://docs.blender.org/manual/en/latest/glossary/index.html#term-Color-Space) determines how Blender decodes stored RGB values. MacBlend samples those decoded values; an incorrect input transform therefore produces an incorrect calibration.
 
-The [Method and limitations](method.md#before-you-start) page explains the setup and the color science behind it.
+```{important}
+The source image's **Color Space** must match the transform used to record or export the file.
+```
 
 ## Workflow
 
-1. Load and correctly tag the source image.
-2. Align the chart overlay and sample its 24 patches.
-3. Optionally sample a target image.
-4. Open a supported node editor and configure the calibration.
-5. Create Forward or Inverse nodes, or export both LUT directions.
+The Blender workflow has two parts:
 
-See [Method and limitations](method.md) for the calculation, normalization behavior, transform directions, and assumptions.
+[Sampling](sampling/index.md)
+: Align a perspective overlay and measure the 24 chart patches. A second sampled chart can serve as the target.
+
+[Calibration](calibration/index.md)
+: Fit a Forward or Inverse matrix and create nodes in a supported node editor.
+
+The resulting transform can optionally be written as paired Forward and Inverse `.cube` files. See [LUT Export](export/index.md).
+
+See [Method and Limitations](method.md) for the calculation, transform directions, and capture assumptions.

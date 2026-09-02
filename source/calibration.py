@@ -1,13 +1,14 @@
 import math
 import importlib
 import os
+import re
 import tempfile
 
 import bpy
 import numpy as np
 from bpy.props import BoolProperty, EnumProperty, StringProperty
 
-from . import colorspaces, core, lut_writer, sampling
+from . import core, lut_writer, sampling
 
 
 MB_OWNER_KEY = "macblend_owner"
@@ -44,6 +45,11 @@ def _find_owned_node(tree, role, generated_key):
 def _debug_logging_enabled(context):
     addon = context.preferences.addons.get(__package__)
     return bool(addon and getattr(addon.preferences, 'debug_logging', False))
+
+
+def _preference_value(context, name, fallback):
+    addon = context.preferences.addons.get(__package__)
+    return getattr(addon.preferences, name, fallback) if addon else fallback
 
 
 def _get_editor_kind(space_data):
@@ -197,52 +203,54 @@ def _set_vector_math_scale_value(node, value):
     raise RuntimeError("Could not find scalar SCALE socket on ShaderNodeVectorMath.")
 
 
-def _load_json_data(context):
-    prefs_addon = context.preferences.addons.get(__package__)
-    if prefs_addon is None:
-        return None
+def _normalized_colorspace_name(name):
+    return re.sub(r'[^a-z0-9]+', '', str(name).lower())
 
-    addon_prefs = getattr(prefs_addon, 'preferences', None)
-    if addon_prefs is None:
-        return None
 
-    json_path = colorspaces.effective_json_path(getattr(addon_prefs, 'json_file_path', None))
-    return colorspaces.load_colorspace_data(json_path)
+_WORKING_SPACE_GAMUT_ALIASES = {
+    'aces': 'ACES',
+    'aces20651': 'ACES',
+    'acesap0': 'ACES',
+    'acescg': 'ACESCG',
+    'acesap1': 'ACESCG',
+    'linearp3d65': 'P3D65',
+    'p3d65': 'P3D65',
+    'linearrec2020': 'REC2020',
+    'linearbt2020': 'REC2020',
+    'rec2020': 'REC2020',
+    'linearrec709': 'REC709',
+    'linearsrgb': 'REC709',
+    'linearsrgbd65': 'REC709',
+    'rec709': 'REC709',
+    'arriwidegamut3': 'ARRI_WIDE_GAMUT_3',
+    'alexawidegamut': 'ARRI_WIDE_GAMUT_3',
+    'arriwidegamut4': 'ARRI_WIDE_GAMUT_4',
+    'redwidegamutrgb': 'RED_WIDE_GAMUT_RGB',
+    'sonysgamut3': 'SONY_SGAMUT3',
+    'sonysgamut3cine': 'SONY_SGAMUT3_CINE',
+    'panasonicvgamut': 'PANASONIC_V_GAMUT',
+    'vgamut': 'PANASONIC_V_GAMUT',
+    'blackmagicwidegamut': 'BLACKMAGIC_WIDE_GAMUT',
+    'filmlightegamut': 'FILMLIGHT_E_GAMUT',
+    'egamut': 'FILMLIGHT_E_GAMUT',
+    'davinciwidegamut': 'DAVINCI_WIDE_GAMUT',
+}
+
+
+def detect_working_space_gamut():
+    try:
+        working_space = _scene_linear_working_space()
+    except ValueError:
+        return None
+    return _WORKING_SPACE_GAMUT_ALIASES.get(
+        _normalized_colorspace_name(working_space),
+    )
 
 
 def _build_reference_samples(context, selected_target):
-    if selected_target == "LINEAR_SRGB_D65":
-        return core.MACBETH_LINEAR_SRGB_D65_BASE.copy()
-
     try:
-        json_data = _load_json_data(context)
-    except colorspaces.ColorspaceDataError as exc:
-        raise ValueError(str(exc)) from exc
-    if json_data is None:
-        raise ValueError(
-            f"Cannot generate reference for '{selected_target}', JSON data is unavailable."
-        )
-
-    try:
-        srgb_to_xyz_m = np.array(json_data["sRGB_to_XYZ_matrix"], dtype=np.float32)
-        base_xyz_d65 = np.dot(core.MACBETH_LINEAR_SRGB_D65_BASE, srgb_to_xyz_m.T)
-
-        xyz_to_target_m = np.array(json_data["XYZ_to_RGB_matrices"][selected_target], dtype=np.float32)
-        target_whitepoint = json_data.get("whitepoints", {}).get(selected_target, 'D65')
-
-        cat_matrix = np.identity(3, dtype=np.float32)
-        if target_whitepoint != 'D65':
-            cat_key = f"D65_to_{target_whitepoint}"
-            if cat_key in json_data.get("CAT_matrices", {}):
-                cat_matrix = np.array(json_data["CAT_matrices"][cat_key], dtype=np.float32)
-
-        xyz_adapted = np.dot(base_xyz_d65, cat_matrix.T)
-        ref_samples = np.dot(xyz_adapted, xyz_to_target_m.T)
-        ref_samples = np.maximum(0.0, ref_samples).astype(np.float32)
-        return ref_samples
-    except KeyError as exc:
-        raise ValueError(f"Missing transform data for target '{selected_target}': {exc}") from exc
-    except Exception as exc:
+        return core.build_reference_values(selected_target).astype(np.float32)
+    except ValueError as exc:
         raise ValueError(f"Failed to build target reference '{selected_target}': {exc}") from exc
 
 
@@ -395,7 +403,7 @@ def _prepare_calibration_data(
         return None, None, None, None, None
 
     if settings.use_reference_target:
-        selected_target = settings.target_colorspace or "LINEAR_SRGB_D65"
+        selected_target = settings.target_colorspace or "REC709"
         try:
             target_samples = _build_reference_samples(context, selected_target)
         except ValueError as exc:
@@ -454,14 +462,21 @@ def _prepare_calibration_data(
             print(f"[MacBlend] Neutral patch idx={neutral_idx} src_grey={tuple(float(v) for v in src_grey)} src_luma={src_luma}", flush=True)
             print(f"[MacBlend] Neutral patch idx={neutral_idx} ref_grey={tuple(float(v) for v in ref_grey)} ref_luma={ref_luma}", flush=True)
 
-        if src_luma > 1e-7:
-            normalization_factor = ref_luma / src_luma
-            if normalize_matrix_input:
-                matrix_input = source_samples * normalization_factor
-            if debug_logging:
-                print(f"[MacBlend] Normalization factor = {normalization_factor}", flush=True)
-        else:
-            normalization_factor = 1.0
+        if not math.isfinite(src_luma) or src_luma <= 1e-7:
+            self.report({'ERROR'}, "Source Neutral 5 luminance must be finite and greater than zero for normalization.")
+            return None, None, None, None, None
+        if not math.isfinite(ref_luma) or ref_luma <= 1e-7:
+            self.report({'ERROR'}, "Target Neutral 5 luminance must be finite and greater than zero for normalization.")
+            return None, None, None, None, None
+
+        normalization_factor = ref_luma / src_luma
+        if not math.isfinite(normalization_factor) or normalization_factor <= 0.0:
+            self.report({'ERROR'}, "Normalization factor must be finite and greater than zero.")
+            return None, None, None, None, None
+        if normalize_matrix_input:
+            matrix_input = source_samples * normalization_factor
+        if debug_logging:
+            print(f"[MacBlend] Normalization factor = {normalization_factor}", flush=True)
 
     if debug_logging:
         print("[MacBlend] Matrix input samples after normalization:", flush=True)
@@ -475,10 +490,10 @@ def _prepare_calibration_data(
         return None, None, None, None, None
 
     matrix_3x3 = matrix_result.matrix
-    if matrix_result.condition_number > 1e4:
+    if matrix_result.transform_condition_number > 1e4:
         self.report(
             {'WARNING'},
-            f"Source samples are poorly conditioned ({matrix_result.condition_number:.2e}); verify chart alignment.",
+            f"Calculated transform is poorly conditioned ({matrix_result.transform_condition_number:.2e}); verify chart alignment.",
         )
     settings.calculated_matrix = matrix_3x3.flatten()
     settings.calculation_done = True
@@ -492,25 +507,26 @@ def _prepare_calibration_data(
     return settings, editor_kind, tree, matrix_3x3, normalization_factor
 
 
-def _scene_linear_working_space(scene):
+def _scene_linear_working_space():
+    blend_colorspace = getattr(bpy.data, 'colorspace', None)
+    name = getattr(blend_colorspace, 'working_space', '')
+    if name:
+        return name
+
     try:
         ocio = importlib.import_module('PyOpenColorIO')
         name = ocio.GetCurrentConfig().getRoleColorSpace('scene_linear')
         if name:
-            return name, False
+            return name
     except (ImportError, AttributeError, RuntimeError):
         pass
 
-    sequencer_settings = getattr(scene, 'sequencer_colorspace_settings', None)
-    name = getattr(sequencer_settings, 'name', '')
-    if name:
-        return name, True
     raise ValueError("Could not resolve Blender's scene-linear working colorspace.")
 
 
 def _lut_target_name(settings):
     if settings.use_reference_target:
-        return settings.target_colorspace or "LINEAR_SRGB_D65"
+        return settings.target_colorspace or "REC709"
     return lut_writer.image_name_token(settings.sample_target_image.name)
 
 
@@ -525,7 +541,7 @@ def _build_lut_exports(operator, context, *, size, clamp):
         return None
 
     try:
-        working_space, used_fallback = _scene_linear_working_space(context.scene)
+        working_space = _scene_linear_working_space()
         forward_matrix, inverse_matrix = lut_writer.compose_export_matrices(
             matrix_3x3,
             normalization_factor,
@@ -533,9 +549,6 @@ def _build_lut_exports(operator, context, *, size, clamp):
     except ValueError as exc:
         operator.report({'ERROR'}, str(exc))
         return None
-
-    if used_fallback:
-        operator.report({'WARNING'}, "Using Blender's sequencer colorspace as the working-space name.")
 
     source_name = lut_writer.image_name_token(settings.sample_source_image.name)
     target_name = _lut_target_name(settings)
@@ -556,6 +569,8 @@ def _build_lut_exports(operator, context, *, size, clamp):
 
 def _write_lut_exports(directory, exports):
     staged_paths = []
+    backup_paths = []
+    installed_paths = []
     try:
         for filename, contents in exports:
             descriptor, staged_path = tempfile.mkstemp(
@@ -564,16 +579,64 @@ def _write_lut_exports(directory, exports):
                 dir=directory,
                 text=True,
             )
+            final_path = os.path.join(directory, filename)
+            staged_paths.append((staged_path, final_path))
             with os.fdopen(descriptor, 'w', encoding='utf-8', newline='\n') as output_file:
                 output_file.write(contents)
-            staged_paths.append((staged_path, os.path.join(directory, filename)))
+
+        for _staged_path, final_path in staged_paths:
+            if not os.path.exists(final_path):
+                continue
+            descriptor, backup_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(final_path)}.",
+                suffix='.bak',
+                dir=directory,
+            )
+            os.close(descriptor)
+            try:
+                os.replace(final_path, backup_path)
+            except OSError:
+                try:
+                    os.remove(backup_path)
+                except OSError:
+                    pass
+                raise
+            backup_paths.append((backup_path, final_path))
 
         for staged_path, final_path in staged_paths:
             os.replace(staged_path, final_path)
+            installed_paths.append(final_path)
+    except OSError as write_error:
+        rollback_errors = []
+        for final_path in reversed(installed_paths):
+            try:
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+            except OSError as exc:
+                rollback_errors.append(str(exc))
+        for backup_path, final_path in reversed(backup_paths):
+            try:
+                os.replace(backup_path, final_path)
+            except OSError as exc:
+                rollback_errors.append(str(exc))
+        if rollback_errors:
+            raise OSError(
+                f"{write_error}; rollback also failed: {'; '.join(rollback_errors)}"
+            ) from write_error
+        raise
     finally:
         for staged_path, _final_path in staged_paths:
             if os.path.exists(staged_path):
-                os.remove(staged_path)
+                try:
+                    os.remove(staged_path)
+                except OSError:
+                    pass
+        for backup_path, _final_path in backup_paths:
+            if os.path.exists(backup_path):
+                try:
+                    os.remove(backup_path)
+                except OSError:
+                    pass
 
 
 def _execute_lut_export(operator, context, *, directory, size, clamp, overwrite):
@@ -796,6 +859,8 @@ class MB_OT_ExportLuts(bpy.types.Operator):
         return _target_is_selected(context)
 
     def invoke(self, context, event):
+        self.lut_size = _preference_value(context, 'default_lut_size', '33')
+        self.clamp_output = _preference_value(context, 'default_lut_clamp', False)
         if not self.directory:
             self.directory = bpy.path.abspath('//') if bpy.data.filepath else os.path.expanduser('~')
         context.window_manager.fileselect_add(self)
@@ -863,6 +928,15 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
         layout.prop(settings, 'use_reference_target')
         if settings.use_reference_target:
             layout.prop(settings, 'target_colorspace', text='Target')
+            if settings.sample_source_image is not None:
+                if settings.auto_detected_target == settings.target_colorspace:
+                    layout.label(text="Auto-detected", icon='CHECKMARK')
+                elif settings.auto_detected_target:
+                    layout.label(text="Target overridden", icon='INFO')
+                else:
+                    row = layout.row()
+                    row.alert = True
+                    row.label(text="Couldn't detect target gamut from scene", icon='CANCEL')
         else:
             layout.prop(settings, 'sample_target_image', text='Target')
         layout.prop(settings, 'normalize_calibration', text='Normalize')
