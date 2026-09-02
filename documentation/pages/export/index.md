@@ -1,17 +1,25 @@
-# LUT export
+# LUT Export
 
-**Export LUTs** calculates the configured transform and writes both Forward and Inverse LUTs in Adobe/Iridas `.cube` format.
+## Context
 
-## Export options
+[Compositor](https://docs.blender.org/manual/en/latest/editors/compositor.html) or [Shader Editor](https://docs.blender.org/manual/en/latest/editors/shader_editor.html) > Sidebar > **MacBlend**
 
-**LUT Size** selects a $17^3$, $33^3$, or $65^3$ lattice. A size of 33 is the default and is a practical general-purpose choice. Larger LUTs require more storage and processing but do not improve the underlying fitted matrix.
+**Export LUTs** writes paired Forward and Inverse LUTs in `.cube` format.
 
-**Clamp to 0-1** restricts output channels to the standard unit range. Leave it disabled when the destination supports extended-range LUT values and preserving highlights or negative values matters. Enable it for applications that reject values outside zero to one.
+## Settings
 
-Choose an output directory and confirm the export. If either destination filename already exists, MacBlend lists the conflicts and asks before replacing the files.
+**LUT Size**
+: Selects a $17^3$, $33^3$, or $65^3$ lattice. The initial size comes from the MacBlend add-on preferences; $33^3$ is suitable for general use. A larger lattice increases file size and processing cost without improving the fitted matrix.
+
+**Clamp to 0-1**
+: Restricts every output channel to the unit range. This supports applications that reject extended values, but discards negative values and values above one.
 
 ## Files
 
-Filenames describe the working space, input image, target, normalization state, and transform direction. Every export produces one filename ending in `_Forward.cube` and one ending in `_Inverse.cube`.
+Filenames use `{working space}_{source}_{target}[_normalized]_{direction}.cube`. The first token identifies Blender's scene-linear working space. A reference target uses the selected targets' name; an image target uses the target image name.
 
-The files include a title, lattice size, domain minimum and maximum, and RGB values with red changing fastest. Test exported LUTs in the destination application because LUT interpretation and out-of-range handling vary between hosts.
+Every export creates one `_Forward.cube` and one `_Inverse.cube` file. Existing destinations are listed for confirmation before replacement.
+
+```{note}
+When **Normalize** is enabled, exported LUTs correct color shifts only; they do not match the target brightness. To create LUTs that correct both color and brightness, disable **Normalize** before exporting.
+```

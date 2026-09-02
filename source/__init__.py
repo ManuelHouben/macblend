@@ -10,18 +10,15 @@ from bpy.props import (
     EnumProperty,
     FloatProperty,
     FloatVectorProperty,
+    IntProperty,
     PointerProperty,
     StringProperty,
 )
 
 from . import calibration
-from . import colorspaces
+from . import core
 from . import manual
 from . import sampling
-
-
-_enum_cache = None
-_enum_cache_key = None
 
 
 def get_image_colorspace_name(image):
@@ -57,83 +54,135 @@ def get_image_sampling_guidance(image):
 
 
 def get_target_colorspace_items(self, context):
-    global _enum_cache, _enum_cache_key
-    items = [("LINEAR_SRGB_D65", "Linear sRGB D65 (Internal)", "Use the internal Linear sRGB D65 reference values")]
+    return [
+        (
+            identifier,
+            label,
+            f"Reference values in the {label} linear gamut",
+        )
+        for identifier, label, _matrix in core.REFERENCE_GAMUTS
+    ]
 
-    if context is None:
-        return items
 
-    json_path = None
-    try:
-        prefs_addon = context.preferences.addons.get(__package__)
-        if prefs_addon:
-            addon_prefs = prefs_addon.preferences
-            if addon_prefs:
-                if hasattr(addon_prefs, 'get_effective_json_path'):
-                    json_path = addon_prefs.get_effective_json_path()
-                else:
-                    json_path = getattr(addon_prefs, 'json_file_path', None)
+def _invalidate_calibration_result(settings, _context=None):
+    settings.calculation_done = False
+    settings.matrix_display_string = "Matrix not calculated."
 
-        cache_key = colorspaces.json_cache_key(json_path)
-        if _enum_cache and _enum_cache_key == cache_key:
-            return _enum_cache
 
-        if not json_path:
-            _enum_cache = items
-            _enum_cache_key = None
-            return items
+def _update_calibration_source_image(settings, _context):
+    _invalidate_calibration_result(settings)
+    if settings.sample_source_image is None:
+        settings.auto_detected_target = ''
+        return
+    detected_target = calibration.detect_working_space_gamut()
+    settings.auto_detected_target = detected_target or ''
+    settings.target_colorspace = detected_target or 'REC709'
 
-        json_data = colorspaces.load_colorspace_data(json_path)
 
-        if "XYZ_to_RGB_matrices" in json_data:
-            sorted_keys = sorted(json_data["XYZ_to_RGB_matrices"].keys())
-            for key in sorted_keys:
-                items.append((key, key, f"Target {key} colorspace from JSON"))
+def _preference_value(name, fallback):
+    addon = bpy.context.preferences.addons.get(__package__)
+    return getattr(addon.preferences, name, fallback) if addon else fallback
 
-        _enum_cache = items
-        _enum_cache_key = cache_key
-        return items
-    except (OSError, colorspaces.ColorspaceDataError) as exc:
-        print(f"[MacBlend] {exc}")
-        return items
+
+def _get_normalize_calibration(settings):
+    return bool(settings.get(
+        'normalize_calibration',
+        _preference_value('default_normalize_calibration', True),
+    ))
+
+
+def _set_normalize_calibration(settings, value):
+    settings['normalize_calibration'] = bool(value)
+    _invalidate_calibration_result(settings)
+
+
+def _get_create_exposure_node(settings):
+    return bool(settings.get(
+        'create_exposure_node',
+        _preference_value('default_create_exposure_node', False),
+    ))
+
+
+def _set_create_exposure_node(settings, value):
+    settings['create_exposure_node'] = bool(value)
 
 
 class MacBlendCalibratorPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
 
-    json_file_path: StringProperty(
-        name="Colorspace JSON File",
-        description="Path to the JSON file containing colorspace transform data. If left empty, the default bundled file will be used.",
-        subtype='FILE_PATH',
-        default="",
+    default_patch_size: IntProperty(
+        name="Patch Size",
+        description="Default Macbeth patch sample size in image pixels",
+        default=sampling.MB_INITIAL_PATCH_SIZE,
+        min=1,
+        max=200,
     )
+    default_overlay_opacity: FloatProperty(
+        name="Overlay Opacity",
+        description="Default opacity of the Macbeth chart overlay",
+        default=0.5,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
+    )
+    default_normalize_calibration: BoolProperty(
+        name="Normalization",
+        description="Enable calibration normalization by default",
+        default=True,
+    )
+    default_create_exposure_node: BoolProperty(
+        name="Exposure Node Creation",
+        description="Create a separate exposure node by default",
+        default=False,
+    )
+    default_lut_size: EnumProperty(
+        name="LUT Size",
+        description="Default exported 3D LUT size",
+        items=(('17', "17", "17x17x17"), ('33', "33", "33x33x33"), ('65', "65", "65x65x65")),
+        default='33',
+    )
+    default_lut_clamp: BoolProperty(
+        name="LUT Clamping",
+        description="Clamp exported LUT values to the 0-1 range by default",
+        default=False,
+    )
+
     debug_logging: BoolProperty(
         name="Debug Logging",
         description="Print sampling and calibration diagnostics to the console",
         default=False,
     )
 
-    def get_effective_json_path(self):
-        return colorspaces.effective_json_path(self.json_file_path)
-
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Specify the path to the colorspace transforms JSON file.")
-        layout.label(text="If left blank, a bundled default file will be used.")
-        layout.prop(self, "json_file_path")
-        layout.prop(self, "debug_logging")
 
-        effective_path = self.get_effective_json_path()
-        if effective_path:
-            box = layout.box()
-            try:
-                colorspaces.load_colorspace_data(effective_path)
-                box.label(text=f"Effective Path: {effective_path}", icon='INFO')
-            except colorspaces.ColorspaceDataError as exc:
-                box.label(text=str(exc), icon='ERROR')
-        else:
-            box = layout.box()
-            box.label(text="Warning: No valid JSON file found.", icon='ERROR')
+        primary_defaults = layout.row()
+        primary_defaults.alignment = 'LEFT'
+
+        sampling_defaults = primary_defaults.column(align=True)
+        sampling_defaults.ui_units_x = 15
+        sampling_defaults.label(text="Sampling")
+        sampling_defaults.prop(self, "default_patch_size", slider=True)
+        sampling_defaults.prop(self, "default_overlay_opacity", slider=True)
+
+        calibration_defaults = primary_defaults.column(align=True)
+        calibration_defaults.label(text="Calibration")
+        calibration_defaults.prop(self, "default_normalize_calibration")
+        calibration_defaults.prop(self, "default_create_exposure_node")
+
+        lut_defaults = layout.column(align=True)
+        lut_defaults.ui_units_x = 15
+        lut_defaults.label(text="LUT Export")
+        lut_size_row = lut_defaults.row()
+        lut_size_row.alignment = 'LEFT'
+        lut_size_row.label(text="LUT Size:")
+        lut_size_row.separator(factor=5)
+        lut_size_dropdown = lut_size_row.row()
+        lut_size_dropdown.prop(self, "default_lut_size", text="")
+        lut_defaults.prop(self, "default_lut_clamp")
+
+        layout.separator()
+        layout.prop(self, "debug_logging")
 
 
 class MacBlendCalibratorSettings(bpy.types.PropertyGroup):
@@ -142,27 +191,32 @@ class MacBlendCalibratorSettings(bpy.types.PropertyGroup):
         description="Macbeth chart calibration data to use when creating the transform",
         type=bpy.types.Image,
         poll=lambda self, obj: sampling.image_has_sample_values(obj),
+        update=_update_calibration_source_image,
     )
     sample_target_image: PointerProperty(
         name="Target Image",
         description="Macbeth chart calibration data to use as the target values",
         type=bpy.types.Image,
         poll=lambda self, obj: sampling.image_has_sample_values(obj),
+        update=_invalidate_calibration_result,
     )
     use_reference_target: BoolProperty(
         name="Use reference values as target",
         description="Use the selected colorspace reference values instead of sampled target image values",
         default=True,
+        update=_invalidate_calibration_result,
     )
     normalize_calibration: BoolProperty(
         name="Normalize",
         description="Pre-scaling source samples to the mid-grey patch before solving the calibration matrix.",
-        default=True,
+        get=_get_normalize_calibration,
+        set=_set_normalize_calibration,
     )
     create_exposure_node: BoolProperty(
         name="Create Exposure Node",
         description="Insert a matching exposure/scale node after the calculated matrix. This is optional and independent from the normalization solve itself.",
-        default=True,
+        get=_get_create_exposure_node,
+        set=_set_create_exposure_node,
     )
     normalization_factor: FloatProperty(
         name="Normalization Factor",
@@ -171,9 +225,16 @@ class MacBlendCalibratorSettings(bpy.types.PropertyGroup):
         min=0.0,
     )
     target_colorspace: EnumProperty(
-        name="Target Colorspace",
-        description="Select the target colorspace reference values",
+        name="Target Gamut",
+        description="Select the target working gamut",
         items=get_target_colorspace_items,
+        update=_invalidate_calibration_result,
+    )
+    auto_detected_target: StringProperty(
+        name="Auto-detected Target",
+        description="Working-space gamut detected when the calibration source image was selected",
+        options={'HIDDEN'},
+        default="",
     )
     calculated_matrix: FloatVectorProperty(
         name="Calculated Matrix (Raw)",
@@ -215,6 +276,7 @@ classes = (
     sampling.MB_OT_FlipOverlayHorizontal,
     sampling.MB_OT_FlipOverlayVertical,
     sampling.MB_OT_CenterOverlayChart,
+    sampling.MB_OT_ResetOverlayChart,
     sampling.MB_OT_OpenPanoramaChartView,
     sampling.MB_OT_SampleImageColors,
     sampling.MB_OT_ClearSampleData,

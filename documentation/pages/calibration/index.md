@@ -1,36 +1,57 @@
-# Calibration transforms
+# Calibration
 
-Open the [Compositor](https://docs.blender.org/manual/en/4.2/editors/compositor.html) or [Shader Editor](https://docs.blender.org/manual/en/4.2/editors/shader_editor.html) and select the **MacBlend** sidebar tab after sampling the source image.
+## Context
 
-## Configure the solve
+[Compositor](https://docs.blender.org/manual/en/latest/editors/compositor.html) or [Shader Editor](https://docs.blender.org/manual/en/latest/editors/shader_editor.html) > Sidebar > **MacBlend**
 
-Start by selecting the sampled source under **Image**. The other settings default to a reference-based, normalized calibration:
+Calibration fits a 3-by-3 RGB matrix between a sampled source and either a built-in chart reference or another sampled image.
 
-- **Use reference values as target** is enabled.
-- **Target** is **Linear sRGB D65 (Internal)**.
-- **Normalize** and **Create Exposure Node** are enabled.
-- **Node Name** is `MacBlendCalibration`.
+<!-- Replacement image: MacBlend calibration panel in Blender's Compositor. A sampled source image is selected, Use reference values as target is enabled, Target shows an Auto-detected status, Normalize and Create Exposure Node are enabled, and the Forward and Inverse operators are visible. -->
+```{figure} ../.images/calibration-panel.jpg
+:alt: Placeholder for the MacBlend calibration panel in a node editor
+:align: center
 
-When using reference values, change **Target** to the gamut in which the source was recorded when appropriate, such as **V-Gamut** for Panasonic V-Gamut footage. The image's IDT must also be set correctly in the [Image Editor](https://docs.blender.org/manual/en/4.2/editors/image/index.html) before sampling. To match one sampled chart image to another instead, disable **Use reference values as target** and select the second image under **Target**.
+Reference-based calibration with an automatically detected target gamut.
+```
 
-With the default normalization, MacBlend uses the Neutral 5 patch and Rec.709 luminance coefficients to separate a broad brightness difference before fitting the matrix. **Create Exposure Node** represents that separated scale as an adjustable node after the matrix. Disable **Normalize** when the solve should include the brightness difference in the matrix; disable **Create Exposure Node** when the separate node is not wanted.
+## Settings
 
-Change **Node Name** only when generated node groups need a different base name.
+**Image**
+: The sampled source. Only images containing all 24 patch values are available.
 
-## Forward
+**Use reference values as target**
+: Uses the built-in chart measurements. When disabled, **Target** selects a second sampled image.
 
-**Forward** creates the fitted calibration matrix. It transforms material or compositor data from the sampled source toward the selected target. When enabled, the exposure node receives the stored normalization scale.
+**Target**
+: Selects the linear gamut of the built-in target values. MacBlend initializes it from Blender's **File Color Space** when the source is selected.
 
-## Inverse
+- ✅ **Auto-detected** means the target matches the file color space.
+- **Target overridden** means another target was selected manually.
+- ❌ **Couldn't detect target gamut from scene** means MacBlend could not find a match and selected **Linear Rec. 709** as a fallback.
 
-**Inverse** creates the inverse of the fitted calibration matrix. It transforms data from the selected target back toward the sampled source. When exposure-node creation is enabled, MacBlend adds the reciprocal normalization scale after the matrix.
+**Normalize**
+: Removes brightness changes from the matrix calculation so the matrix captures only color shifts.
 
-Both commands require a valid source and target and a supported node editor. A singular fitted matrix cannot be inverted for **Inverse**.
+**Create Exposure Node**
+: Creates a separate brightness adjustment node that matches the target brightness.
 
-## Matrix result
+**Node Name**
+: Base name for generated Forward and Inverse matrix nodes. The default is `MacBlendCalibration`.
 
-After a successful solve, the panel displays the fitted matrix. The generated node group applies the RGB matrix while preserving alpha in compositor workflows.
+```{important}
+The **Target** setting's [gamut](https://docs.blender.org/manual/en/latest/glossary/index.html#term-Color-Gamut) should match the **Color Space** setting of your file. A gamut is the range of colors that a color space can represent.
+```
 
-Always inspect the result on representative imagery. A chart fit can be numerically valid while still reflecting poor lighting, clipped patches, incorrect input color spaces, or a chart overlay aligned in the wrong orientation.
+## Operators
 
-See [Method and limitations](../method.md) for a plain-language explanation of the workflow, its limits, and links to the deeper technical resources.
+**Forward**
+: Creates nodes that transform the sampled source toward the selected target.
+
+**Inverse**
+: Creates nodes that transform the selected target toward the sampled source.
+
+## Matrix Result
+
+The fitted matrix appears in the panel after a successful solve. A valid matrix does not guarantee a useful calibration; poor illumination, clipping, an incorrect input transform, or reversed chart orientation can all bias the result.
+
+See [Method and Limitations](../method.md) for the calculation and capture assumptions.

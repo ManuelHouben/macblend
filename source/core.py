@@ -3,18 +3,131 @@ from dataclasses import dataclass
 import numpy as np
 
 # --- Constants ---
-MACBETH_LINEAR_SRGB_D65_BASE = np.array([
-    [0.17355167, 0.07874029, 0.05326058], [0.55946176, 0.27734355, 0.21194777], [0.10509124, 0.18955202, 0.32693865],
-    [0.10506442, 0.15021316, 0.05221047], [0.22885963, 0.21350031, 0.42346758], [0.11449231, 0.50663347, 0.41229432],
-    [0.74499115, 0.20172072, 0.0325174 ], [0.0606182 , 0.10259253, 0.38373146], [0.56055825, 0.08072134, 0.11432307],
-    [0.10983077, 0.04254067, 0.13682661], [0.32967574, 0.49495612, 0.04886544], [0.7689789 , 0.35655545, 0.02534346],
-    [0.0225082 , 0.04870543, 0.28081679], [0.0444356 , 0.29068277, 0.06458335], [0.44636923, 0.03676343, 0.0406788 ],
-    [0.83803037, 0.57175305, 0.01273052], [0.52392518, 0.07924915, 0.28656418], [0.0       , 0.23415773, 0.37506175],
-    [0.87919095, 0.88476747, 0.8349529 ], [0.58443959, 0.59212352, 0.58458201], [0.35767777, 0.36706043, 0.36528718],
-    [0.19008669, 0.19086038, 0.1898278 ], [0.08593528, 0.08873843, 0.08978779], [0.03135966, 0.03149993, 0.03231098]
-], dtype=np.float32)
+CHART_SIZE = (838, 562)
+CHART_COLUMNS = 6
+CHART_ROWS = 4
+CHART_PATCH_CELL_RATIO = 0.8
+MACBETH_XYZ_D50 = np.array([
+    [0.1136398927, 0.09832436105, 0.047793811],
+    [0.3811104477, 0.336202304, 0.1852590702],
+    [0.1652470004, 0.1785519348, 0.2546024121],
+    [0.1114392339, 0.1346792679, 0.05239320311],
+    [0.2419823988, 0.2287175998, 0.3282104382],
+    [0.30451114, 0.4143554688, 0.344352688],
+    [0.4073691399, 0.3126416159, 0.05130591012],
+    [0.1200518326, 0.1091090233, 0.2874447494],
+    [0.2915036416, 0.188999956, 0.09736350318],
+    [0.08353888545, 0.06276662955, 0.1042075686],
+    [0.3427379502, 0.4331759409, 0.08330791241],
+    [0.4769723742, 0.4293377578, 0.06005041429],
+    [0.06809095613, 0.05596214063, 0.2077405936],
+    [0.1413517689, 0.2233437582, 0.07287461742],
+    [0.2143728424, 0.127800835, 0.03868150726],
+    [0.5888922356, 0.5992976803, 0.07077420003],
+    [0.299122798, 0.1895114577, 0.2213469194],
+    [0.1247966941, 0.180609913, 0.2913392383],
+    [0.8436985288, 0.8806903203, 0.6936778752],
+    [0.5665335579, 0.5899709702, 0.4828473821],
+    [0.3495921991, 0.3648652066, 0.3013565492],
+    [0.1835495863, 0.1906228754, 0.1566717383],
+    [0.08448968042, 0.08817234828, 0.07391630753],
+    [0.03042544265, 0.03151319431, 0.02656724434],
+], dtype=np.float64)
 
-# Legacy CalibrateMacbeth.nk behavior uses Rec.709 luminance coefficients for chroma-only normalization.
+MACBETH_D50_TO_D65_CAT02 = np.array([
+    [0.9598786831, -0.0293238461, 0.06578332186],
+    [-0.02120095305, 0.9988456964, 0.02618063986],
+    [0.001372883562, 0.004445131868, 1.313236713],
+], dtype=np.float64)
+
+REFERENCE_GAMUTS = (
+    ('ACES', 'ACES', (
+        (1.062366107, 0.008406953654, -0.01665578963),
+        (-0.4939413716, 1.371109525, 0.09031658697),
+        (-0.0003346685774, -0.001037458272, 0.9194696473),
+    )),
+    ('ACESCG', 'ACEScg', (
+        (1.658854308, -0.3118569754, -0.2431560071),
+        (-0.6622832871, 1.612199571, 0.0158591266),
+        (0.01148056646, -0.009236324924, 0.9166865134),
+    )),
+    ('P3D65', 'P3D65', (
+        (2.493496912, -0.9313836179, -0.4027107845),
+        (-0.8294889696, 1.76266406, 0.02362468584),
+        (0.03584583024, -0.07617238927, 0.956884524),
+    )),
+    ('REC2020', 'Rec.2020', (
+        (1.716651188, -0.3556707838, -0.2533662814),
+        (-0.6666843518, 1.616481237, 0.01576854581),
+        (0.01763985745, -0.04277061326, 0.9421031212),
+    )),
+    ('REC709', 'Linear Rec. 709', (
+        (3.240969942, -1.537383178, -0.4986107603),
+        (-0.9692436363, 1.875967502, 0.04155505741),
+        (0.0556300797, -0.2039769589, 1.056971514),
+    )),
+    ('ARRI_WIDE_GAMUT_3', 'Arri WideGamut 3', (
+        (1.789065551, -0.4825338638, -0.2000757929),
+        (-0.6398486599, 1.396399957, 0.1944322918),
+        (-0.04153154585, 0.08233537355, 0.8788684803),
+    )),
+    ('ARRI_WIDE_GAMUT_4', 'Arri WideGamut 4', (
+        (1.509215472, -0.2505973452, -0.1688114753),
+        (-0.4915454517, 1.361245546, 0.09728294201),
+        (0.0, 0.0, 0.9182249512),
+    )),
+    ('RED_WIDE_GAMUT_RGB', 'Red WideGamut RGB', (
+        (1.41280648, -0.177523201, -0.151770732),
+        (-0.4862032769, 1.290696427, 0.1574006147),
+        (-0.03713901085, 0.2863759998, 0.6876797789),
+    )),
+    ('SONY_SGAMUT3', 'Sony SGamut3', (
+        (1.507399899, -0.2458221374, -0.1716116808),
+        (-0.5181517271, 1.355391241, 0.1258786682),
+        (0.01551169816, -0.007872771427, 0.9119163656),
+    )),
+    ('SONY_SGAMUT3_CINE', 'Sony SGamut3.Cine', (
+        (1.846778969, -0.525986123, -0.2105452114),
+        (-0.4441532629, 1.259442903, 0.1493999729),
+        (0.0408554212, 0.01564088931, 0.8682072487),
+    )),
+    ('PANASONIC_V_GAMUT', 'Panasonic V-Gamut', (
+        (1.589011774, -0.3132044845, -0.1809648515),
+        (-0.5340529104, 1.396011433, 0.102457671),
+        (0.01117944884, 0.003194128241, 0.9055353563),
+    )),
+    ('BLACKMAGIC_WIDE_GAMUT', 'Blackmagic Wide Gamut', (
+        (1.866357736, -0.5183905088, -0.2346067165),
+        (-0.6003298545, 1.378119951, 0.1767281098),
+        (0.002451481064, 0.08638160934, 0.8367677153),
+    )),
+    ('FILMLIGHT_E_GAMUT', 'Filmlight E-Gamut', (
+        (1.52505277, -0.3159135109, -0.1226582646),
+        (-0.50915256, 1.333327409, 0.1382843651),
+        (0.09571534531, 0.05089744385, 0.7879557703),
+    )),
+    ('DAVINCI_WIDE_GAMUT', 'DaVinci Wide Gamut', (
+        (1.516672042, -0.2814780479, -0.1469636332),
+        (-0.4649171012, 1.251423776, 0.1748846089),
+        (0.06484904707, 0.1091393437, 0.7614146215),
+    )),
+)
+
+REFERENCE_GAMUT_MATRICES = {
+    identifier: np.asarray(matrix, dtype=np.float64)
+    for identifier, _label, matrix in REFERENCE_GAMUTS
+}
+
+
+def build_reference_values(gamut):
+    try:
+        xyz_to_rgb = REFERENCE_GAMUT_MATRICES[gamut]
+    except KeyError as exc:
+        raise ValueError(f"Unknown reference gamut: {gamut}") from exc
+    xyz_d65 = MACBETH_XYZ_D50 @ MACBETH_D50_TO_D65_CAT02.T
+    return xyz_d65 @ xyz_to_rgb.T
+
+
 LUMA_COEFFS_REC709 = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 
@@ -27,7 +140,7 @@ class MatrixResult:
     matrix: np.ndarray
     rank: int
     singular_values: np.ndarray
-    condition_number: float
+    transform_condition_number: float
 
 
 def clamp_sample_region(image_size, center_x, center_y, patch_size):
@@ -281,6 +394,131 @@ def map_chart_point(homography, u, v):
         raise ValueError("Chart point maps to infinity.")
     return (float(mapped[0] / mapped[2]), float(mapped[1] / mapped[2]))
 
+
+def map_chart_points(homography, chart_points):
+    points = np.asarray(chart_points, dtype=np.float64)
+    if points.shape[-1] != 2:
+        raise ValueError("Chart points must end with two coordinates.")
+    homogeneous = np.concatenate(
+        (points.reshape((-1, 2)), np.ones((points.size // 2, 1))),
+        axis=1,
+    )
+    mapped = homogeneous @ np.asarray(homography, dtype=np.float64).T
+    if np.any(np.abs(mapped[:, 2]) < 1e-12):
+        raise ValueError("Chart point maps to infinity.")
+    mapped = mapped[:, :2] / mapped[:, 2:3]
+    return mapped.reshape(points.shape)
+
+
+def chart_rectified_size(corners, image_size):
+    points = _validate_quad(corners).copy()
+    image_width, image_height = image_size
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("Image dimensions must be positive.")
+    points[:, 0] *= image_width
+    points[:, 1] *= image_height
+    top, right, bottom, left = np.linalg.norm(np.roll(points, -1, axis=0) - points, axis=1)
+    return ((top + bottom) * 0.5, (right + left) * 0.5)
+
+
+def chart_patch_size(chart_size, *, maximum=200):
+    chart_width, chart_height = chart_size
+    if chart_width <= 0 or chart_height <= 0:
+        raise ValueError("Rectified chart dimensions must be positive.")
+    nominal_cell_size = min(chart_width / CHART_COLUMNS, chart_height / CHART_ROWS)
+    return max(1, min(int(maximum), int(round(nominal_cell_size * CHART_PATCH_CELL_RATIO))))
+
+
+def effective_patch_size(patch_size, image_size, *, maximum=200):
+    image_width, image_height = image_size
+    return max(1, min(int(patch_size), int(maximum), int(max(image_width, image_height))))
+
+
+def chart_patch_uv(slot):
+    if not 0 <= int(slot) < 24:
+        raise ValueError("Macbeth patch slot must be between 0 and 23.")
+    row, column = divmod(int(slot), CHART_COLUMNS)
+    return (
+        (column + 0.5) / CHART_COLUMNS,
+        1.0 - (row + 0.5) / CHART_ROWS,
+    )
+
+
+def chart_patch_footprint(homography, slot, patch_size, chart_size=CHART_SIZE):
+    chart_width, chart_height = chart_size
+    if chart_width <= 0 or chart_height <= 0:
+        raise ValueError("Rectified chart dimensions must be positive.")
+    sample_size = max(1, int(patch_size))
+    center_u, center_v = chart_patch_uv(slot)
+    half_u = sample_size / (2.0 * chart_width)
+    half_v = sample_size / (2.0 * chart_height)
+    chart_corners = np.array((
+        (center_u - half_u, center_v - half_v),
+        (center_u + half_u, center_v - half_v),
+        (center_u + half_u, center_v + half_v),
+        (center_u - half_u, center_v + half_v),
+    ))
+    return map_chart_points(homography, chart_corners)
+
+
+def bilinear_sample_image_uv(pixel_buffer, image_u, image_v):
+    pixels = normalize_rgb_channels(np.asarray(pixel_buffer, dtype=np.float32))
+    if pixels.ndim != 3:
+        raise ValueError("Pixel buffer must have shape (height, width, channels).")
+    height, width, _channels = pixels.shape
+    if width <= 0 or height <= 0:
+        raise ValueError("Image has no sampleable pixel area.")
+
+    image_u, image_v = np.broadcast_arrays(
+        np.asarray(image_u, dtype=np.float64),
+        np.asarray(image_v, dtype=np.float64),
+    )
+    pixel_x = np.clip(image_u * width - 0.5, 0.0, width - 1.0)
+    pixel_y = np.clip(image_v * height - 0.5, 0.0, height - 1.0)
+    x0 = np.floor(pixel_x).astype(np.int64)
+    y0 = np.floor(pixel_y).astype(np.int64)
+    x1 = np.minimum(x0 + 1, width - 1)
+    y1 = np.minimum(y0 + 1, height - 1)
+    weight_x = (pixel_x - x0)[..., np.newaxis]
+    weight_y = (pixel_y - y0)[..., np.newaxis]
+    top = pixels[y0, x0] * (1.0 - weight_x) + pixels[y0, x1] * weight_x
+    bottom = pixels[y1, x0] * (1.0 - weight_x) + pixels[y1, x1] * weight_x
+    return top * (1.0 - weight_y) + bottom * weight_y
+
+
+def sample_warped_chart_patch(
+    pixel_buffer,
+    homography,
+    slot,
+    patch_size,
+    *,
+    chart_size=CHART_SIZE,
+    panorama_projection=None,
+):
+    chart_width, chart_height = chart_size
+    sample_size = max(1, int(patch_size))
+    center_u, center_v = chart_patch_uv(slot)
+    offsets = np.arange(sample_size, dtype=np.float64) + 0.5 - sample_size * 0.5
+    grid_u, grid_v = np.meshgrid(
+        center_u + offsets / chart_width,
+        center_v + offsets / chart_height,
+    )
+    image_points = map_chart_points(homography, np.stack((grid_u, grid_v), axis=-1))
+    if panorama_projection is None:
+        samples = bilinear_sample_image_uv(
+            pixel_buffer,
+            image_points[..., 0],
+            image_points[..., 1],
+        )
+    else:
+        panorama_u, panorama_v = rectilinear_to_equirectangular_uv(
+            image_points[..., 0],
+            image_points[..., 1],
+            **panorama_projection,
+        )
+        samples = bilinear_sample_equirectangular(pixel_buffer, panorama_u, panorama_v)
+    return tuple(np.mean(samples, axis=(0, 1), dtype=np.float64).astype(np.float32))
+
 def calculate_matrix_result(input_samples, ref_samples, *, debug=False):
     input_samples = np.asarray(input_samples, dtype=np.float64)
     ref_samples = np.asarray(ref_samples, dtype=np.float64)
@@ -291,8 +529,7 @@ def calculate_matrix_result(input_samples, ref_samples, *, debug=False):
     if not np.any(input_samples) or not np.any(ref_samples):
         raise CalibrationError("Calibration samples cannot be all zero.")
     try:
-        # Match the Nuke tools' legacy least-squares behavior: solve A x = B and
-        # transpose the result before flattening / storing it.
+        # Solve A x = B and transpose the result for the RGB matrix convention.
         result_x, residuals, rank, s = np.linalg.lstsq(input_samples, ref_samples, rcond=-1)
         matrix_calculated = result_x
         if debug:
@@ -311,11 +548,11 @@ def calculate_matrix_result(input_samples, ref_samples, *, debug=False):
     if np.linalg.matrix_rank(matrix_final) < 3 or matrix_singular_values[-1] <= 0.0:
         raise CalibrationError("Calibration produced a singular 3x3 transform.")
     if debug:
-        print("        Nuke-style transposed matrix:")
+        print("        Transposed RGB matrix:")
         for row in matrix_final:
             print(f"          [{row[0]:>9.6f} {row[1]:>9.6f} {row[2]:>9.6f}]")
-    condition_number = float(matrix_singular_values[0] / matrix_singular_values[-1])
-    return MatrixResult(matrix_final.astype(np.float32), int(rank), s, condition_number)
+    transform_condition_number = float(matrix_singular_values[0] / matrix_singular_values[-1])
+    return MatrixResult(matrix_final.astype(np.float32), int(rank), s, transform_condition_number)
 
 
 def calculate_matrix(input_samples, ref_samples, *, debug=False):

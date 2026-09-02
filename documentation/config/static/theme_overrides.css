@@ -1,7 +1,3 @@
-:root {
-    --macblend-accent-warm: #c9512c;
-}
-
 .sidebar-brand-text {
     display: block;
     font-size: 2rem;
@@ -21,6 +17,14 @@
     object-fit: contain;
 }
 
-.content a:hover {
-    text-decoration-color: var(--macblend-accent-warm);
+.content h1 {
+    font-size: 2rem;
+}
+
+.content h2 {
+    font-size: 1.5rem;
+}
+
+.content h3 {
+    font-size: 1.25rem;
 }

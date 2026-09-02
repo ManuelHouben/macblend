@@ -1,45 +1,100 @@
-# Sampling a chart
+# Sampling
 
-Sampling is performed in the [Image Editor](https://docs.blender.org/manual/en/4.2/editors/image/index.html) from the **MacBlend** sidebar tab.
+## Context
 
-## Prepare the image
+[Image Editor](https://docs.blender.org/manual/en/latest/editors/image/index.html) > Sidebar > **MacBlend**
 
-1. Open the chart image in Blender's Image Editor.
-2. Set the image's input [**Color Space**](https://docs.blender.org/manual/en/4.2/editors/image/image_settings.html#bpy-types-colormanagedinputcolorspacesettings-name) to match the file.
-3. Open the sidebar and select the **MacBlend** tab.
-4. Set **Patch Size** to an area that remains inside each colored patch.
+MacBlend samples the 24 patches of a 6-by-4 Macbeth ColorChecker from Blender's decoded, scene-linear image data. The image [**Color Space**](https://docs.blender.org/manual/en/latest/editors/image/image_settings.html#bpy-types-colormanagedinputcolorspacesettings-name) must therefore describe the source file correctly.
 
-Patch Size is measured in image pixels. Larger values average more pixels but can cross patch borders on a small or strongly skewed chart.
+## Chart Overlay
 
-## Align the overlay
+<!-- Replacement image: Blender Image Editor showing a photographed Macbeth ColorChecker. The MacBlend sidebar is open, Show Overlay is enabled, all four corner handles touch the chart corners, and every colored sample square remains inside its patch. -->
+```{figure} ../.images/sampling-overlay.jpg
+:alt: Placeholder for the aligned MacBlend chart overlay in the Image Editor
+:align: center
 
-Enable **Show Overlay**, then drag each corner handle onto the corresponding outer corner of the chart.
-Use **Flip Horizontal** or **Flip Vertical** when the patch order does not match the image orientation.
+Chart overlay aligned to the outer corners of a Macbeth ColorChecker.
+```
 
-While dragging a corner, use the mouse wheel to scale the chart around that corner. Scroll up to enlarge the chart or down to shrink it. Hold **Ctrl** to move all four corners together, or hold **Ctrl** and **Alt** and drag horizontally to rotate the chart around the selected corner. Hold **Shift** for precision movement or rotation. These modifiers can be pressed or released after the drag has started.
+**Show Overlay**
+: Shows the Macbeth chart overlay in the Image Editor. It is initialized in the center of the image with a patch size of 40 by 40 pixels. Later toggles preserve edits.
 
-Use **Center Overlay** to reset the overlay to a 28:21 rectangle centered in the visible viewer and occupying approximately 10 percent of the viewer area.
+**Patch Size**
+: Sets the size of the patches used for sampling, in image pixels. When **Sample Chart** is used, MacBlend averages the pixels inside each patch. Larger patches average more pixels, but must remain inside the chart's colored areas.
 
-Expand **Corner Positions** when numeric corner coordinates are more convenient than dragging.
+**Overlay Opacity**
+: Controls the opacity of the color swatches shown inside the chart overlay. Before the image has been sampled, the swatches show built-in sRGB reference colors; afterward, they show the stored sampled colors. This setting affects only the overlay display, not the sampled values.
 
-### Lat-long panoramas
+**Flip Horizontal**, **Flip Vertical**
+: Reverses the patch order to match the chart orientation.
 
-For an equirectangular HDRI, first align the overlay roughly around the chart in the original lat-long image, then select **Lat/Long Projection** below the overlay controls. MacBlend centers the undistorted rectilinear view on the chart's middle axis and automatically adjusts roll so that axis forms the horizon, then projects the existing corners into the view so the alignment remains consistent. The calculations wrap horizontally, so this also works when the chart is split across the left and right image edges.
+**Center Overlay**
+: Re-initializes the chart overlay at a size that fills approximately one tenth of the viewer area. **Patch Size** is recalculated as a result.
 
-Align and sample precisely in the projected view as usual; MacBlend reads the corresponding wrapped pixels from the original HDRI. Select **Disable Lat/Long Projection** to return to the original image using the same button. The temporary projected image is removed when leaving the view.
+**Reset Chart**
+: Restores the initial image-space position and patch size.
 
-Heading, Elevation, Roll, Field of View, and the final Patch Size are stored with the sampled colors on the original image. Projection controls update the projected image immediately, and sampling maps the final chart corners back to normalized positions on the original flat image. Reopening the projected view reuses these settings until the overlay is moved in the flat image view; moving it discards the stored projection and recalculates from the new alignment on the next activation.
+**Corner Positions**
+: Exposes image-space coordinates for the four handles.
 
-## Sample patches
+### Mouse Controls
 
-Select **Sample Chart** after alignment. MacBlend reads the decoded pixel buffer once, averages the configured region around every patch center, stores 24 RGB values on the image, and hides the overlay.
+Dragging a handle moves one corner. The following modifiers remain available after the drag has started:
 
-Successfully sampled images appear in **Sampled Images**. Select an entry to inspect its 24 color swatches. The trash button clears that image's samples and removes it from any active source or target selection.
+{kbd}`Wheel`
+: Scales the chart around the active corner.
 
-## Sampling guidance
+{kbd}`Ctrl`
+: Moves all four corners together.
 
-- Keep every sample region inside its patch and away from borders, glare, shadows, and chart damage.
-- Use source imagery without clipped channels when possible.
-- Sampling the same image twice replaces its previous values.
-- The [display/view transform](https://docs.blender.org/manual/en/4.2/render/color_management.html#display-transforms) does not alter sampled values.
-- Changing the image input color space does alter sampled values; resample after changing it.
+{kbd}`Ctrl-Alt` and horizontal drag
+: Rotates the chart around the active corner.
+
+{kbd}`Shift`
+: Enables precision movement or rotation.
+
+```{note}
+Keep every visible sample region away from patch borders, glare, shadows, reflections, and chart damage.
+```
+
+## Lat-Long Projection
+
+<!-- Replacement image: Blender Image Editor in MacBlend's rectilinear projection view of an equirectangular HDRI. The chart is centered and level, the overlay is precisely aligned, and Heading, Elevation, Roll, Field of View, and Patch Size controls are visible. -->
+```{figure} ../.images/lat-long-projection.jpg
+:alt: Placeholder for a ColorChecker aligned in the lat-long projection view
+:align: center
+
+Rectilinear chart view projected from an equirectangular image.
+```
+
+**Lat/Long Projection** creates an undistorted rectilinear view centered on the chart's middle axis.
+
+**Heading**, **Elevation**, **Roll**, **Field of View**
+: Adjust the projected view.
+
+**Disable Lat/Long Projection**
+: Returns to the original image and removes the temporary projection.
+
+Projection settings and the final **Patch Size** are stored with the samples on the original image.
+
+```{important}
+Moving the overlay in the flat image resets the sampling area. Sample a lat-long image's chart in the projected lat-long view to avoid sampling incorrect areas.
+```
+
+## Sample Chart
+
+**Sample Chart** averages each projected sample region, stores 24 RGB values on the image, and hides the overlay. Sampling the same image again replaces its previous values.
+
+<!-- Replacement image: MacBlend's Sampled Images panel showing one selected image and a 6-by-4 grid of the 24 measured color swatches, with the remove button visible beside the image entry. -->
+```{figure} ../.images/sampled-images.jpg
+:alt: Placeholder for the Sampled Images panel and its 24 color swatches
+:align: center
+
+Measured patches for the selected sampled image.
+```
+
+Sampled images become available as calibration sources and targets. Removing an entry clears its samples and any active source or target selection that uses it.
+
+```{important}
+The [display transform](https://docs.blender.org/manual/en/latest/render/color_management.html#display-transforms) does not affect sampled values. Changing the image input **Color Space** does; sample the chart again after changing it.
+```

@@ -1,27 +1,29 @@
 # Troubleshooting
 
-## An image cannot be selected
+## Image Is Not Available
 
-Only images with a complete set of 24 sampled values appear in source and sampled-target selectors. Return to the [Image Editor](https://docs.blender.org/manual/en/4.2/editors/image/index.html), align the overlay, and select **Sample Chart**.
+Source and target selectors only include images with all 24 sampled values. In the [Image Editor](https://docs.blender.org/manual/en/latest/editors/image/index.html), align the overlay and use **Sample Chart**.
 
-## Results look too dark, bright, or strongly tinted
+## Incorrect Brightness or Color
 
-Verify the input [**Color Space**](https://docs.blender.org/manual/en/4.2/editors/image/image_settings.html#bpy-types-colormanagedinputcolorspacesettings-name) on every sampled image. MacBlend reads Blender's decoded values, so an incorrect input transform directly changes the solve. Also verify chart orientation, patch alignment, clipping, uneven lighting, reflections, and whether **Normalize** and **Create Exposure Node** are appropriate for the workflow.
+Verify the input [**Color Space**](https://docs.blender.org/manual/en/latest/editors/image/image_settings.html#bpy-types-colormanagedinputcolorspacesettings-name) on every sampled image. An incorrect input transform changes the values used by the fit.
 
-## Reference color spaces are missing
+Other common causes are reversed chart orientation, inaccurate corner alignment, clipped patches, uneven lighting, reflections, and an unsuitable **Normalize** or **Create Exposure Node** setting.
 
-MacBlend includes linear sRGB D65 reference values and loads additional transforms from `mmColorTarget_colorspace_transforms.json`. In the extension preferences, clear the custom path to use the bundled file. If a custom file is selected, confirm that it exists and contains valid 3-by-3 matrices.
+## Incorrect Target Gamut
 
-## Sampling fails or uses too much memory
+MacBlend supports 14 target gamuts. It matches explicit aliases for Blender's blend-file working space, or the OCIO `scene_linear` role on older Blender versions, and shows **Auto-detected** when it finds one. Otherwise, it shows **Couldn't detect target gamut from scene** and keeps **Linear Rec. 709** selected as a fallback. Select the actual scene-linear working gamut manually when a custom OCIO configuration uses another name.
 
-The image must have a valid pixel resolution and a supported channel count. Reduce image dimensions when memory is constrained. A larger **Patch Size** increases averaging work only modestly, but the full decoded image buffer must still fit in memory.
+## Sampling Fails or Uses Too Much Memory
+
+The image requires a valid resolution and supported channel count. Its full decoded pixel buffer must fit in memory; reduce the image dimensions when memory is constrained. **Patch Size** has comparatively little effect on peak memory.
 
 Enable **Debug Logging** in the MacBlend extension preferences to print pixel-transfer, patch-average, and calibration diagnostics to Blender's console.
 
-## An Inverse transform cannot be created
+## Inverse Is Unavailable
 
-Inverse requires the fitted matrix to be invertible. Check for missing, uniform, clipped, or incorrectly ordered samples. Resample the chart after correcting the image and overlay.
+**Inverse** requires an invertible fitted matrix. Missing, uniform, clipped, or incorrectly ordered samples can produce a singular result. Correct the image or overlay and sample the chart again.
 
-## Reporting a problem
+## Reporting a Problem
 
-Open a [GitHub bug report](https://github.com/ManuelHouben/macblend/issues/new?template=bug_report.md) and include Blender and MacBlend versions, operating system, exact steps, image color-space settings, relevant console output, and screenshots or redistributable sample files.
+Open a [GitHub bug report](https://github.com/ManuelHouben/macblend/issues/new?template=bug_report.md) with the Blender and MacBlend versions, operating system, reproduction steps, image color-space settings, relevant console output, and screenshots or redistributable sample files.

@@ -76,11 +76,11 @@ class FilenameTests(unittest.TestCase):
             "ACEScg_source.chart_target_normalized_Inverse.cube",
         )
         unnormalized_filename = lut_writer.build_lut_filename(
-            "Linear Rec.709", source, "LINEAR_SRGB_D65", normalized=False, mode="Forward"
+            "Linear Rec.709", source, "REC709", normalized=False, mode="Forward"
         )
         self.assertEqual(
             unnormalized_filename,
-            "Linear Rec.709_source.chart_LINEAR_SRGB_D65_Forward.cube",
+            "Linear Rec.709_source.chart_REC709_Forward.cube",
         )
         self.assertNotIn("__", unnormalized_filename)
 
