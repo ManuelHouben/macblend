@@ -283,6 +283,7 @@ classes = (
     sampling.MB_PT_ImageEditorSamplePanel,
     calibration.MB_OT_ForwardTransform,
     calibration.MB_OT_InverseTransform,
+    calibration.MB_OT_ConfirmTransform,
     calibration.MB_OT_ExportLuts,
     calibration.MB_OT_ConfirmLutOverwrite,
     calibration.MB_PT_CalibrationPanel,
