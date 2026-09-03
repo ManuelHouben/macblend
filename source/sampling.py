@@ -281,6 +281,14 @@ def _selected_sample_image(scene):
     return None
 
 
+def _peek_selected_sample_image(scene):
+    ui_state = getattr(scene, 'macblend_sampling_ui', None)
+    if ui_state is None:
+        return None
+    image = ui_state.selected_image
+    return image if image is not None and image_has_sample_values(image) else None
+
+
 def _set_selected_sample_image(scene, image):
     global _MB_SYNCING_SAMPLE_SELECTION
     ui_state = getattr(scene, 'macblend_sampling_ui', None)
@@ -1783,10 +1791,10 @@ class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
             rows=3,
         )
         delete_column = list_row.column(align=True)
-        delete_column.enabled = _selected_sample_image(context.scene) is not None
+        delete_column.enabled = _peek_selected_sample_image(context.scene) is not None
         delete_column.operator('macblend.clear_sample_data', text='', icon='TRASH')
 
-        selected_image = _selected_sample_image(context.scene)
+        selected_image = _peek_selected_sample_image(context.scene)
         display_data = selected_image.mb_sample_data if selected_image is not None else ui_state
         box = layout.box()
         box.label(text='Sampled Values')
