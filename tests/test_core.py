@@ -146,6 +146,25 @@ class HomographyTests(unittest.TestCase):
 
         np.testing.assert_allclose(size, ((edges[0] + edges[2]) / 2, (edges[1] + edges[3]) / 2))
 
+    def test_chart_geometry_metrics_identify_regular_and_mirrored_charts(self):
+        corners = ((0.25, 0.75), (0.75, 0.75), (0.75, 0.25), (0.25, 0.25))
+
+        self.assertLess(core.chart_signed_area(corners), 0.0)
+        np.testing.assert_allclose(core.chart_corner_angles(corners, (1000, 1000)), 90.0)
+        self.assertAlmostEqual(core.panorama_chart_angular_width(corners), np.pi)
+        self.assertGreater(core.chart_signed_area((corners[1], corners[0], corners[3], corners[2])), 0.0)
+
+    def test_panorama_angular_width_wraps_at_the_seam(self):
+        corners = ((0.94, 0.7), (0.06, 0.7), (0.06, 0.3), (0.94, 0.3))
+
+        self.assertAlmostEqual(core.panorama_chart_angular_width(corners), np.deg2rad(43.2))
+
+    def test_angular_size_at_distance_is_finite_or_unavailable(self):
+        self.assertAlmostEqual(core.angular_size_at_distance(np.deg2rad(30.0), 2.0), 4.0 * np.tan(np.deg2rad(15.0)))
+        self.assertIsNone(core.angular_size_at_distance(np.deg2rad(170.0), 2.0))
+        self.assertIsNone(core.angular_size_at_distance(np.inf, 2.0))
+        self.assertIsNone(core.angular_size_at_distance(np.deg2rad(30.0), 0.0))
+
     def test_patch_size_is_eighty_percent_of_smallest_cell(self):
         self.assertEqual(core.chart_patch_size((300, 200)), 40)
         self.assertEqual(core.chart_patch_size((600, 320)), 64)

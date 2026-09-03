@@ -107,6 +107,10 @@ def _set_create_exposure_node(settings, value):
     settings['create_exposure_node'] = bool(value)
 
 
+def _update_gizmo_scale(_preferences, _context):
+    sampling._tag_image_editor_redraw()
+
+
 class MacBlendCalibratorPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
 
@@ -124,6 +128,15 @@ class MacBlendCalibratorPreferences(bpy.types.AddonPreferences):
         min=0.0,
         max=1.0,
         subtype='FACTOR',
+    )
+    gizmo_scale: FloatProperty(
+        name="Gizmo Scale",
+        description="Scale corner crosses and flip controls in the Image Editor",
+        default=1.0,
+        min=0.25,
+        max=4.0,
+        soft_max=2.0,
+        update=_update_gizmo_scale,
     )
     default_normalize_calibration: BoolProperty(
         name="Normalization",
@@ -164,6 +177,7 @@ class MacBlendCalibratorPreferences(bpy.types.AddonPreferences):
         sampling_defaults.label(text="Sampling")
         sampling_defaults.prop(self, "default_patch_size", slider=True)
         sampling_defaults.prop(self, "default_overlay_opacity", slider=True)
+        sampling_defaults.prop(self, "gizmo_scale")
 
         calibration_defaults = primary_defaults.column(align=True)
         calibration_defaults.label(text="Calibration")
@@ -268,7 +282,6 @@ classes = (
     sampling.MB_ImageSampleData,
     sampling.MB_SamplingUIState,
     sampling.MB_UL_SampledImages,
-    sampling.MB_GT_OverlaySquare,
     sampling.MB_GT_CornerCross,
     sampling.MB_GT_FlipArrow,
     sampling.MB_GGT_ImageEditorOverlay,
@@ -277,6 +290,7 @@ classes = (
     sampling.MB_OT_FlipOverlayVertical,
     sampling.MB_OT_CenterOverlayChart,
     sampling.MB_OT_ResetOverlayChart,
+    sampling.MB_OT_ConfirmSamplingSanityChecks,
     sampling.MB_OT_OpenPanoramaChartView,
     sampling.MB_OT_SampleImageColors,
     sampling.MB_OT_ClearSampleData,

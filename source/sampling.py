@@ -1,5 +1,7 @@
 import numpy as np
 import bpy
+import gpu
+import textwrap
 from . import core
 from math import cos, sin
 from mathutils import Vector
@@ -15,6 +17,7 @@ from bpy.props import (
     PointerProperty,
     StringProperty,
 )
+from gpu_extras.batch import batch_for_shader
 
 
 MB_MSGBUS_OWNER = object()
@@ -42,6 +45,12 @@ MB_PANORAMA_VIEW_MARKER = 'macblend_panorama_chart_view'
 MB_PRECISION_DRAG_FACTOR = 0.1
 MB_WHEEL_SCALE_FACTOR = 1.05
 MB_ROTATE_RADIANS_PER_PIXEL = 0.01
+MB_CHART_MIN_CORNER_ANGLE = 60.0
+MB_CHART_MAX_CORNER_ANGLE = 120.0
+MB_PANORAMA_FOV_WARNING_DEGREES = 120.0
+MB_SANITY_ACTION_PROJECTION = 'PROJECTION'
+MB_SANITY_ACTION_SAMPLE = 'SAMPLE'
+MB_SANITY_ACTION_LEAVE_PROJECTION = 'LEAVE_PROJECTION'
 
 MB_MACBETH_REFERENCE_SRGB = (
     (116 / 255.0, 81 / 255.0, 67 / 255.0),
@@ -79,6 +88,10 @@ def _debug_logging_enabled(context):
 def _preference_value(name, fallback):
     addon = bpy.context.preferences.addons.get(__package__)
     return getattr(addon.preferences, name, fallback) if addon else fallback
+
+
+def _gizmo_display_scale():
+    return float(_preference_value('gizmo_scale', 1.0))
 
 
 def _set_drag_cursor(window):
@@ -123,6 +136,7 @@ _MB_SYNCING_SAMPLE_SELECTION = False
 _MB_SYNCING_SAMPLE_VALUES = False
 _MB_PANORAMA_PIXEL_CACHE = {}
 _MB_UPDATING_PROJECTED_CORNERS = False
+_MB_IMAGE_EDITOR_OVERLAY_HANDLER = None
 
 
 def _grid_point(corners, u, v, homography=None):
@@ -177,6 +191,87 @@ def _tag_image_editor_redraw():
         for area in window.screen.areas:
             if area.type == 'IMAGE_EDITOR':
                 area.tag_redraw()
+
+
+def _draw_image_editor_overlay():
+    context = bpy.context
+    image = getattr(getattr(context, 'space_data', None), 'image', None)
+    region = getattr(context, 'region', None)
+    if image is None or region is None or not getattr(image, 'mb_sample_data', None):
+        return
+
+    data = image.mb_sample_data
+    if not data.show_overlay:
+        return
+
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return
+
+    try:
+        corners = _get_overlay_corners(data, image)
+        homography = core.build_chart_homography(corners)
+        chart_size, patch_size = _chart_sample_geometry(corners, (width, height), data.patch_size)
+    except ValueError:
+        return
+
+    samples_by_slot = {
+        int(sample.patch_index): sample
+        for sample in data.samples
+        if 0 <= int(sample.patch_index) < len(MB_CCMASTER)
+    }
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    overlay_alpha = min(float(data.overlay_opacity), MB_OVERLAY_RENDER_ALPHA_MAX)
+    gpu.state.blend_set('ALPHA')
+    try:
+        for index in range(len(MB_CCMASTER)):
+            footprint = core.chart_patch_footprint(
+                homography,
+                index,
+                patch_size,
+                chart_size=chart_size,
+            )
+            region_points = [_region_point(context, point) for point in footprint]
+            if any(point is None for point in region_points):
+                continue
+
+            if index in samples_by_slot:
+                fill_color = _linear_to_srgb(samples_by_slot[index].rgb)
+            else:
+                fill_color = MB_MACBETH_REFERENCE_SRGB[index]
+            shader.uniform_float('color', (*fill_color, overlay_alpha))
+            batch_for_shader(
+                shader,
+                'TRIS',
+                {'pos': (region_points[0], region_points[1], region_points[2], region_points[0], region_points[2], region_points[3])},
+            ).draw(shader)
+
+            shader.uniform_float('color', (*MB_MACBETH_REFERENCE_SRGB[index], 1.0))
+            batch_for_shader(
+                shader,
+                'LINES',
+                {'pos': (region_points[0], region_points[1], region_points[1], region_points[2], region_points[2], region_points[3], region_points[3], region_points[0])},
+            ).draw(shader)
+    finally:
+        gpu.state.blend_set('NONE')
+
+
+def _add_image_editor_overlay_handler():
+    global _MB_IMAGE_EDITOR_OVERLAY_HANDLER
+    if _MB_IMAGE_EDITOR_OVERLAY_HANDLER is None:
+        _MB_IMAGE_EDITOR_OVERLAY_HANDLER = bpy.types.SpaceImageEditor.draw_handler_add(
+            _draw_image_editor_overlay,
+            (),
+            'WINDOW',
+            'POST_PIXEL',
+        )
+
+
+def _remove_image_editor_overlay_handler():
+    global _MB_IMAGE_EDITOR_OVERLAY_HANDLER
+    if _MB_IMAGE_EDITOR_OVERLAY_HANDLER is not None:
+        bpy.types.SpaceImageEditor.draw_handler_remove(_MB_IMAGE_EDITOR_OVERLAY_HANDLER, 'WINDOW')
+        _MB_IMAGE_EDITOR_OVERLAY_HANDLER = None
 
 
 def _fit_image_in_editor(context):
@@ -550,6 +645,92 @@ def _panorama_fov_for_chart(corners, heading, elevation, roll, aspect_ratio):
     ))
 
 
+def _chart_sanity_check_findings(image, data, action):
+    corners = _get_overlay_corners(data, image)
+    homography = core.build_chart_homography(corners)
+    findings = []
+    if core.chart_signed_area(corners) >= 0.0:
+        findings.append(
+            'Patch order is reversed. Reset Chart, then use Flip Horizontal and/or '
+            'Flip Vertical to match the physical chart orientation.'
+        )
+
+    corner_angles = core.chart_corner_angles(corners, image.size)
+    smallest_angle = float(np.min(corner_angles))
+    largest_angle = float(np.max(corner_angles))
+    if smallest_angle < MB_CHART_MIN_CORNER_ANGLE or largest_angle > MB_CHART_MAX_CORNER_ANGLE:
+        findings.append(
+            'Your chart appears to be strongly distorted - samples may be inaccurate. Avoid extreme angles while shooting as they can introduce unwanted glare and Fresnel reflections.'
+        )
+
+    if action == MB_SANITY_ACTION_PROJECTION:
+        angular_width = core.panorama_chart_angular_width(corners)
+        angular_width_degrees = float(np.rad2deg(angular_width))
+        illustration_width = core.angular_size_at_distance(angular_width, 2.0)
+        illustration = (
+            f' If the chart is at 2 m from the camera, this suggests it is '
+            f'{illustration_width:.2f} m wide, which is kind of big for a ColorChecker.'
+            if illustration_width is not None
+            else ' The implied chart width at 2 m is unavailable at this extreme angle.'
+        )
+        try:
+            heading, elevation, roll = _panorama_angles_from_overlay(
+                corners,
+                float(data.panorama_fov),
+                MB_PANORAMA_VIEW_SIZE[0] / MB_PANORAMA_VIEW_SIZE[1],
+            )
+            required_fov = _panorama_fov_for_chart(
+                corners,
+                heading,
+                elevation,
+                roll,
+                MB_PANORAMA_VIEW_SIZE[0] / MB_PANORAMA_VIEW_SIZE[1],
+            )
+        except ValueError:
+            raise ValueError(
+                f'The alignment spans {angular_width_degrees:.0f} degrees of the panorama and cannot '
+                'be represented by one rectilinear chart view. Reset Chart and align tightly around '
+                'one physical ColorChecker.'
+            )
+        required_fov_degrees = float(np.rad2deg(required_fov))
+        if required_fov_degrees > MB_PANORAMA_FOV_WARNING_DEGREES:
+            findings.append(
+                f'The chart spans {angular_width_degrees:.0f} degrees and needs a {required_fov_degrees:.0f} '
+                f'degree rectilinear view, which can be strongly distorted.{illustration} Align tightly '
+                'around one physical ColorChecker for more reliable results.'
+            )
+
+    if action == MB_SANITY_ACTION_SAMPLE:
+        chart_size, patch_size = _chart_sample_geometry(corners, image.size, data.patch_size)
+        out_of_bounds = 0
+        for slot in range(len(MB_CCMASTER)):
+            footprint = core.chart_patch_footprint(homography, slot, patch_size, chart_size=chart_size)
+            if np.any(footprint < 0.0) or np.any(footprint > 1.0):
+                out_of_bounds += 1
+        if out_of_bounds:
+            findings.append(
+                f'{out_of_bounds} sample regions extend outside the image and will be clipped. Reduce '
+                'Patch Size or realign the chart before sampling.'
+            )
+    return findings
+
+
+def _invoke_sanity_checks(operator, context, image, data, action):
+    try:
+        findings = _chart_sanity_check_findings(image, data, action)
+    except ValueError as exc:
+        operator.report({'ERROR'}, f'Chart alignment needs correction: {exc}')
+        return {'CANCELLED'}
+    if not findings:
+        return operator.execute(context)
+    bpy.ops.macblend.confirm_sampling_sanity_checks(
+        'INVOKE_DEFAULT',
+        action=action,
+        findings='\n'.join(findings),
+    )
+    return {'FINISHED'}
+
+
 def _store_projected_corners_on_source(source_data, projected_corners, view_size):
     global _MB_UPDATING_PROJECTED_CORNERS
     width, height = view_size
@@ -740,6 +921,19 @@ def _set_overlay_opacity(data, value):
     data['overlay_opacity'] = float(value)
 
 
+def _ensure_overlay_initialized(data, image):
+    if data.get(MB_OVERLAY_INITIALIZED_KEY, False):
+        return
+
+    corner_names = ('corner_tl', 'corner_tr', 'corner_br', 'corner_bl')
+    if all(data.get(name) is not None for name in corner_names):
+        data[MB_OVERLAY_INITIALIZED_KEY] = True
+    elif image is not None and getattr(data, 'panorama_source_image', None) is None:
+        _initialize_overlay(data, image, data.patch_size)
+    else:
+        data[MB_OVERLAY_INITIALIZED_KEY] = True
+
+
 def _get_show_overlay(data):
     stored_value = data.get('show_overlay')
     if stored_value is not None:
@@ -749,20 +943,13 @@ def _get_show_overlay(data):
 
 def _set_show_overlay(data, value):
     if value and not data.get(MB_OVERLAY_INITIALIZED_KEY, False):
-        corner_names = ('corner_tl', 'corner_tr', 'corner_br', 'corner_bl')
-        if all(data.get(name) is not None for name in corner_names):
-            data[MB_OVERLAY_INITIALIZED_KEY] = True
-        else:
-            image = getattr(data, 'id_data', None)
-            if image is not None and getattr(data, 'panorama_source_image', None) is None:
-                _initialize_overlay(data, image, data.patch_size)
-            else:
-                data[MB_OVERLAY_INITIALIZED_KEY] = True
+        _ensure_overlay_initialized(data, getattr(data, 'id_data', None))
     data['show_overlay'] = bool(value)
 
 
 @persistent
 def MB_Messagebus_Init(*args):
+    _add_image_editor_overlay_handler()
     bpy.msgbus.clear_by_owner(MB_MSGBUS_OWNER)
     bpy.msgbus.subscribe_rna(
         key=(bpy.types.SpaceImageEditor, 'image'),
@@ -806,6 +993,7 @@ def MB_ImageColorspace_Changed():
 
 def MB_Messagebus_Remove():
     bpy.msgbus.clear_by_owner(MB_MSGBUS_OWNER)
+    _remove_image_editor_overlay_handler()
     _clear_panorama_pixel_cache()
 
 
@@ -820,29 +1008,6 @@ def _cross_triangles(length, width):
         (-half_width, -half_length), (half_width, -half_length), (half_width, -half_width),
         (-half_width, -half_length), (half_width, -half_width), (-half_width, -half_width),
     )
-
-
-class MB_GT_OverlaySquare(bpy.types.Gizmo):
-    style: IntProperty(default=0, options={'SKIP_SAVE'})
-
-    def setup(self):
-        self.region_points = None
-
-    def draw(self, context):
-        if self.region_points is None:
-            return
-        point_0, point_1, point_2, point_3 = self.region_points
-        if self.style == 0:
-            shape = self.new_custom_shape(
-                'LINES',
-                (point_0, point_1, point_1, point_2, point_2, point_3, point_3, point_0),
-            )
-        else:
-            shape = self.new_custom_shape(
-                'TRIS',
-                (point_0, point_1, point_2, point_0, point_2, point_3),
-            )
-        self.draw_custom_shape(shape)
 
 
 class MB_GT_CornerCross(bpy.types.Gizmo):
@@ -936,25 +1101,8 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
         return image is not None and getattr(image, 'mb_sample_data', None) is not None and image.mb_sample_data.show_overlay
 
     def setup(self, context):
-        self.outlines = []
-        self.fills = []
         self.corners = []
         self.flip_buttons = []
-
-        for _ in range(24):
-            outline = self.gizmos.new('MB_GT_OverlaySquare')
-            outline.style = 0
-            outline.color = outline.color_highlight = (1.0, 1.0, 1.0)
-            outline.alpha = outline.alpha_highlight = 1.0
-            outline.use_draw_modal = True
-            self.outlines.append(outline)
-
-            fill = self.gizmos.new('MB_GT_OverlaySquare')
-            fill.style = 1
-            fill.color = fill.color_highlight = (0.2, 0.95, 0.35)
-            fill.alpha = fill.alpha_highlight = 0.35
-            fill.use_draw_modal = True
-            self.fills.append(fill)
 
         for corner_idx in range(4):
             corner = self.gizmos.new('MB_GT_CornerCross')
@@ -989,16 +1137,6 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
             button.target_set_operator(operator_id)
             self.flip_buttons.append(button)
 
-    def _set_quad(self, gizmo, context, points):
-        region_points = [_region_point(context, point) for point in points]
-        if any(point is None for point in region_points):
-            gizmo.hide = True
-            return
-
-        gizmo.hide = False
-        gizmo.matrix_basis.identity()
-        gizmo.region_points = tuple(region_points)
-
     def _set_cross(self, gizmo, context, point):
         region_point = _region_point(context, point)
         if region_point is None:
@@ -1007,8 +1145,9 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
 
         gizmo.hide = False
         gizmo.matrix_basis.identity()
-        gizmo.matrix_basis[0][0] = MB_CORNER_CROSS_SCALE
-        gizmo.matrix_basis[1][1] = MB_CORNER_CROSS_SCALE
+        scale = MB_CORNER_CROSS_SCALE * _gizmo_display_scale()
+        gizmo.matrix_basis[0][0] = scale
+        gizmo.matrix_basis[1][1] = scale
         gizmo.matrix_basis[0][3] = region_point[0]
         gizmo.matrix_basis[1][3] = region_point[1]
 
@@ -1027,7 +1166,7 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
         axis_len = max((axis[0] ** 2 + axis[1] ** 2) ** 0.5, 1e-6)
         x_axis = (axis[0] / axis_len, axis[1] / axis_len)
         y_axis = (-x_axis[1], x_axis[0])
-        scale = MB_FLIP_BUTTON_SCALE
+        scale = MB_FLIP_BUTTON_SCALE * _gizmo_display_scale()
 
         gizmo.hide = False
         gizmo.matrix_basis.identity()
@@ -1045,13 +1184,13 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
 
         image = getattr(getattr(context, 'space_data', None), 'image', None)
         if image is None or not getattr(image, 'mb_sample_data', None) or not image.mb_sample_data.show_overlay:
-            for gizmo in self.outlines + self.fills + self.corners + self.flip_buttons:
+            for gizmo in self.corners + self.flip_buttons:
                 gizmo.hide = True
             return
 
         width, height = image.size
         if width <= 0 or height <= 0:
-            for gizmo in self.outlines + self.fills + self.corners + self.flip_buttons:
+            for gizmo in self.corners + self.flip_buttons:
                 gizmo.hide = True
             return
 
@@ -1059,44 +1198,11 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
         try:
             homography = core.build_chart_homography(corners)
         except ValueError:
-            for gizmo in self.outlines + self.fills + self.flip_buttons:
+            for gizmo in self.flip_buttons:
                 gizmo.hide = True
             for corner_idx, corner_gizmo in enumerate(self.corners):
                 self._set_cross(corner_gizmo, context, corners[corner_idx])
             return
-        # Blender gizmo triangle fills can show internal seams at exactly 1.0 alpha.
-        # Keep render alpha infinitesimally below opaque to avoid the artifact.
-        overlay_alpha = min(float(image.mb_sample_data.overlay_opacity), MB_OVERLAY_RENDER_ALPHA_MAX)
-        chart_size, patch_size = _chart_sample_geometry(
-            corners,
-            (width, height),
-            image.mb_sample_data.patch_size,
-        )
-
-        samples_by_slot = {
-            int(sample.patch_index): sample
-            for sample in image.mb_sample_data.samples
-            if 0 <= int(sample.patch_index) < len(MB_CCMASTER)
-        }
-        for index in range(len(MB_CCMASTER)):
-            cell_points = core.chart_patch_footprint(
-                homography,
-                index,
-                patch_size,
-                chart_size=chart_size,
-            )
-
-            self._set_quad(self.outlines[index], context, cell_points)
-            self._set_quad(self.fills[index], context, cell_points)
-            self.outlines[index].color = self.outlines[index].color_highlight = MB_MACBETH_REFERENCE_SRGB[index]
-
-            if index in samples_by_slot:
-                patch_color = samples_by_slot[index].rgb
-                patch_color = _linear_to_srgb(patch_color)
-                self.fills[index].color = self.fills[index].color_highlight = patch_color
-            else:
-                self.fills[index].color = self.fills[index].color_highlight = MB_MACBETH_REFERENCE_SRGB[index]
-            self.fills[index].alpha = self.fills[index].alpha_highlight = overlay_alpha
 
         for corner_idx in range(4):
             corner_gizmo = self.corners[corner_idx]
@@ -1291,7 +1397,7 @@ class MB_OT_FlipOverlayVertical(bpy.types.Operator):
 class MB_OT_CenterOverlayChart(bpy.types.Operator):
     bl_idname = 'macblend.center_overlay_chart'
     bl_label = 'Center Overlay'
-    bl_description = 'Center a 3:2 Macbeth chart at 10% of the viewer area and fit Patch Size to its cells'
+    bl_description = 'Center a Macbeth chart in the visible Image Editor view and fit Patch Size to its cells'
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -1322,7 +1428,7 @@ class MB_OT_CenterOverlayChart(bpy.types.Operator):
         _tag_image_editor_redraw()
         self.report(
             {'INFO'},
-            f'Centered 3:2 overlay with {image.mb_sample_data.patch_size}px patches.',
+            f'Centered overlay with {image.mb_sample_data.patch_size}px patches.',
         )
         return {'FINISHED'}
 
@@ -1357,11 +1463,104 @@ class MB_OT_ResetOverlayChart(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MB_OT_ConfirmSamplingSanityChecks(bpy.types.Operator):
+    bl_idname = 'macblend.confirm_sampling_sanity_checks'
+    bl_label = 'Check Chart Alignment'
+
+    action: EnumProperty(
+        options={'HIDDEN'},
+        items=(
+            (MB_SANITY_ACTION_PROJECTION, 'Lat-Long Projection', ''),
+            (MB_SANITY_ACTION_SAMPLE, 'Sample Chart', ''),
+            (MB_SANITY_ACTION_LEAVE_PROJECTION, 'Leave Lat-Long Projection', ''),
+        ),
+    )
+    findings: StringProperty(options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(
+            self,
+            width=520,
+            title='Check Chart Alignment',
+            confirm_text='I Understand, Continue Anyway',
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text='Chart alignment needs attention', icon='ERROR')
+        findings = self.findings.splitlines()
+        if findings:
+            layout.separator(factor=0.35)
+        for index, finding in enumerate(findings):
+            finding_column = layout.column(align=True)
+            finding_column.scale_y = 0.9
+            for line in textwrap.wrap(
+                finding,
+                width=74,
+                break_long_words=False,
+                break_on_hyphens=False,
+            ):
+                finding_column.label(text=line)
+            if index < len(findings) - 1:
+                layout.separator(factor=0.8)
+        layout.separator(factor=0.8)
+        tip_column = layout.column(align=True)
+        tip_column.label(text='Tip', icon='LIGHT')
+        for line in textwrap.wrap(
+            'For a quick alignment, move the image until the ColorChecker is centered in the '
+            'Image Editor, zoom until it fills about one third of the panel, then click Center Overlay.',
+            width=74,
+            break_long_words=False,
+            break_on_hyphens=False,
+        ):
+            tip_column.label(text=line)
+
+    def execute(self, context):
+        if self.action in {MB_SANITY_ACTION_PROJECTION, MB_SANITY_ACTION_LEAVE_PROJECTION}:
+            return bpy.ops.macblend.open_panorama_chart_view(
+                'EXEC_DEFAULT',
+                skip_sanity_checks=True,
+            )
+        if self.action == MB_SANITY_ACTION_SAMPLE:
+            return bpy.ops.macblend.sample_image_colors(
+                'EXEC_DEFAULT',
+                skip_sanity_checks=True,
+            )
+        self.report({'ERROR'}, 'Unknown chart alignment action.')
+        return {'CANCELLED'}
+
+
 class MB_OT_OpenPanoramaChartView(bpy.types.Operator):
     bl_idname = 'macblend.open_panorama_chart_view'
     bl_label = 'Toggle Lat-Long Chart View'
     bl_description = 'Enter or exit the undistorted lat-long chart view'
     bl_options = {'REGISTER'}
+
+    skip_sanity_checks: BoolProperty(options={'HIDDEN'}, default=False)
+
+    def invoke(self, context, event):
+        if self.skip_sanity_checks:
+            return self.execute(context)
+        active_image = getattr(getattr(context, 'space_data', None), 'image', None)
+        source_image = _panorama_source(active_image)
+        if source_image is not None:
+            return _invoke_sanity_checks(
+                self,
+                context,
+                active_image,
+                active_image.mb_sample_data,
+                MB_SANITY_ACTION_LEAVE_PROJECTION,
+            )
+        if active_image is None or not getattr(active_image, 'mb_sample_data', None):
+            return self.execute(context)
+        _ensure_overlay_initialized(active_image.mb_sample_data, active_image)
+        return _invoke_sanity_checks(
+            self,
+            context,
+            active_image,
+            active_image.mb_sample_data,
+            MB_SANITY_ACTION_PROJECTION,
+        )
 
     def execute(self, context):
         active_image = getattr(getattr(context, 'space_data', None), 'image', None)
@@ -1381,6 +1580,7 @@ class MB_OT_OpenPanoramaChartView(bpy.types.Operator):
             return {'CANCELLED'}
 
         source_data = source_image.mb_sample_data
+        _ensure_overlay_initialized(source_data, source_image)
         if source_data.projection_mode != 'EQUIRECTANGULAR':
             corners = _get_overlay_corners(source_data, source_image)
             aspect_ratio = MB_PANORAMA_VIEW_SIZE[0] / MB_PANORAMA_VIEW_SIZE[1]
@@ -1596,6 +1796,24 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
     bl_label = "Sample Chart"
     bl_description = "Sample the 24 Macbeth patch values from the active image"
     bl_options = {'REGISTER', 'UNDO'}
+
+    skip_sanity_checks: BoolProperty(options={'HIDDEN'}, default=False)
+
+    def invoke(self, context, event):
+        if self.skip_sanity_checks:
+            return self.execute(context)
+        image = getattr(context.space_data, 'image', None)
+        if image is None:
+            return self.execute(context)
+        if _panorama_source(image) is None:
+            _ensure_overlay_initialized(image.mb_sample_data, image)
+        return _invoke_sanity_checks(
+            self,
+            context,
+            image,
+            image.mb_sample_data,
+            MB_SANITY_ACTION_SAMPLE,
+        )
 
     def execute(self, context):
         image = getattr(context.space_data, 'image', None)
@@ -1814,7 +2032,6 @@ classes = (
     MB_ImageSampleData,
     MB_SamplingUIState,
     MB_UL_SampledImages,
-    MB_GT_OverlaySquare,
     MB_GT_CornerCross,
     MB_GT_FlipArrow,
     MB_GGT_ImageEditorOverlay,

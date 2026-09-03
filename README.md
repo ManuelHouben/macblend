@@ -60,4 +60,4 @@ MacBlend is licensed under the [GNU General Public License v3.0 or later](LICENS
 
 ## Acknowledgements
 
-MacBlend owes much to Marco Meyer's [mmColorTarget](https://www.marcomeyer-vfx.de/posts/mmcolortarget-nuke-gizmo/), Jed Smith's [CalibrateMacbeth](https://gist.github.com/jedypod/798b365ea64e8121999e7036ae7e0217), and Paul Schlichter's Colour Chart Camera Matcher add-on.
+MacBlend owes much to Marco Meyer's [mmColorTarget](https://www.marcomeyer-vfx.de/posts/mmcolortarget-nuke-gizmo/), Jed Smith's [CalibrateMacbeth](https://gist.github.com/jedypod/798b365ea64e8121999e7036ae7e0217), and Paul Schlichter's [Colour Chart Camera Matcher](https://paulschlichter.gumroad.com/l/ccc_matcher) add-on.
