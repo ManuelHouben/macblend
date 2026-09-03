@@ -29,7 +29,7 @@ Chart overlay aligned to the outer corners of a Macbeth ColorChecker.
 : Reverses the patch order to match the chart orientation.
 
 **Center Overlay**
-: Re-initializes the chart overlay at a size that fills approximately one tenth of the viewer area. **Patch Size** is recalculated as a result.
+: Re-initializes the chart overlay in the current Image Editor view. **Patch Size** is recalculated as a result.
 
 **Reset Chart**
 : Restores the initial image-space position and patch size.
@@ -67,7 +67,7 @@ Keep every visible sample region away from patch borders, glare, shadows, reflec
 Rectilinear chart view projected from an equirectangular image.
 ```
 
-**Lat/Long Projection** creates an undistorted rectilinear view centered on the chart's middle axis.
+**Lat/Long Projection** creates an undistorted rectilinear view centered on the chart's middle axis. Useful for sampling 360 HDRI images.
 
 **Heading**, **Elevation**, **Roll**, **Field of View**
 : Adjust the projected view.
@@ -76,6 +76,15 @@ Rectilinear chart view projected from an equirectangular image.
 : Returns to the original image and removes the temporary projection.
 
 Projection settings and the final **Patch Size** are stored with the samples on the original image.
+
+### Alignment Checks
+
+Before creating or leaving a Lat-Long view, and before sampling, MacBlend checks the chart alignment. A warning explains any issue and lets you abort to correct it or continue deliberately.
+
+- Reset the chart and use **Flip Horizontal** or **Flip Vertical** if the patch order is reversed.
+- Align tightly around the colorchart. A chart that fills a very wide panorama produces an impractical rectilinear field of view; the warning shows its angular coverage.
+- Keep the four chart corners close to right angles. Strongly irregular geometry could indicate the presence of glare and Fresnel reflections on the patches which can make sampled values inaccurate.
+- Reduce **Patch Size** or realign if sample regions reach outside the image.
 
 ```{important}
 Moving the overlay in the flat image resets the sampling area. Sample a lat-long image's chart in the projected lat-long view to avoid sampling incorrect areas.

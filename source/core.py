@@ -421,6 +421,78 @@ def chart_rectified_size(corners, image_size):
     return ((top + bottom) * 0.5, (right + left) * 0.5)
 
 
+def chart_signed_area(corners):
+    """Return the signed area of an ordered chart quadrilateral."""
+    points = _validate_quad(corners)
+    return float(0.5 * np.sum(
+        points[:, 0] * np.roll(points[:, 1], -1)
+        - points[:, 1] * np.roll(points[:, 0], -1)
+    ))
+
+
+def chart_corner_angles(corners, image_size):
+    """Return the four interior chart-corner angles in degrees."""
+    points = _validate_quad(corners).copy()
+    image_width, image_height = image_size
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("Image dimensions must be positive.")
+    points *= (image_width, image_height)
+    previous = np.roll(points, 1, axis=0) - points
+    following = np.roll(points, -1, axis=0) - points
+    previous_length = np.linalg.norm(previous, axis=1)
+    following_length = np.linalg.norm(following, axis=1)
+    if np.any(previous_length <= 1e-10) or np.any(following_length <= 1e-10):
+        raise ValueError("Chart corners must not overlap.")
+    cosine = np.sum(previous * following, axis=1) / (previous_length * following_length)
+    return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
+
+def panorama_chart_angular_width(corners):
+    """Return the angular span between the middle points of chart sides in radians."""
+    corner_array = _validate_quad(corners)
+    longitude_angles = corner_array[:, 0] * (2.0 * np.pi)
+    mean_sin = float(np.mean(np.sin(longitude_angles)))
+    mean_cos = float(np.mean(np.cos(longitude_angles)))
+    if np.hypot(mean_sin, mean_cos) < 1e-8:
+        longitude_reference = float(np.mean(corner_array[:, 0]))
+    else:
+        longitude_reference = float(np.mod(np.arctan2(mean_sin, mean_cos) / (2.0 * np.pi), 1.0))
+
+    unwrapped_corners = corner_array.copy()
+    unwrapped_corners[:, 0] = longitude_reference + np.mod(
+        corner_array[:, 0] - longitude_reference + 0.5,
+        1.0,
+    ) - 0.5
+    homography = build_chart_homography(unwrapped_corners)
+    middle_left = map_chart_point(homography, 0.0, 0.5)
+    middle_right = map_chart_point(homography, 1.0, 0.5)
+    middle_points = np.asarray((middle_left, middle_right), dtype=np.float64)
+    longitude = (middle_points[:, 0] - 0.5) * (2.0 * np.pi)
+    latitude = (middle_points[:, 1] - 0.5) * np.pi
+    cosine_latitude = np.cos(latitude)
+    directions = np.stack(
+        (
+            np.sin(longitude) * cosine_latitude,
+            np.sin(latitude),
+            np.cos(longitude) * cosine_latitude,
+        ),
+        axis=-1,
+    )
+    return float(np.arccos(np.clip(np.dot(directions[0], directions[1]), -1.0, 1.0)))
+
+
+def angular_size_at_distance(angular_width, distance):
+    """Return the physical width subtended by an angle, or None when unsafe."""
+    angular_width = float(angular_width)
+    distance = float(distance)
+    if not np.isfinite(angular_width) or not np.isfinite(distance):
+        return None
+    if not 0.0 < angular_width < np.deg2rad(170.0) or distance <= 0.0:
+        return None
+    width = 2.0 * distance * np.tan(angular_width * 0.5)
+    return float(width) if np.isfinite(width) else None
+
+
 def chart_patch_size(chart_size, *, maximum=200):
     chart_width, chart_height = chart_size
     if chart_width <= 0 or chart_height <= 0:

@@ -644,6 +644,35 @@ try:
         atol=1e-6,
     )
 
+    fresh_panorama = bpy.data.images.new("MacBlend Fresh Panorama", width=1000, height=500, alpha=True, float_buffer=True)
+    fresh_space = type("FreshPanoramaSpace", (), {"image": fresh_panorama})()
+    fresh_context = type(
+        "FreshPanoramaContext",
+        (),
+        {
+            "space_data": fresh_space,
+            "scene": bpy.context.scene,
+            "preferences": bpy.context.preferences,
+        },
+    )()
+    fresh_reports = []
+    fresh_operator = type(
+        "FreshPanoramaReporter",
+        (),
+        {"report": lambda self, levels, message: fresh_reports.append((levels, message))},
+    )()
+    assert fresh_panorama.mb_sample_data.get(sampling.MB_OVERLAY_INITIALIZED_KEY) is None
+    assert sampling.MB_OT_OpenPanoramaChartView.execute(fresh_operator, fresh_context) == {'FINISHED'}
+    fresh_corners = sampling._get_overlay_corners(fresh_panorama.mb_sample_data, fresh_panorama)
+    assert fresh_panorama.mb_sample_data.get(sampling.MB_OVERLAY_INITIALIZED_KEY)
+    assert fresh_corners[1][0] - fresh_corners[0][0] < 0.5
+    assert fresh_panorama.mb_sample_data.projection_mode == 'EQUIRECTANGULAR'
+    assert fresh_space.image.mb_sample_data.panorama_source_image == fresh_panorama
+    assert not fresh_reports or fresh_reports[-1][0] != {'ERROR'}
+    assert sampling.MB_OT_OpenPanoramaChartView.execute(fresh_operator, fresh_context) == {'FINISHED'}
+    assert fresh_space.image == fresh_panorama
+    bpy.data.images.remove(fresh_panorama)
+
     panorama = bpy.data.images.new("MacBlend Panorama", width=8, height=4, alpha=True, float_buffer=True)
     panorama_pixels = np.zeros((4, 8, 4), dtype=np.float32)
     panorama_pixels[..., 0] = np.linspace(0.0, 1.0, 8)
