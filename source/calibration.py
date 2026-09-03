@@ -3,6 +3,7 @@ import importlib
 import os
 import re
 import tempfile
+import textwrap
 
 import bpy
 import numpy as np
@@ -16,6 +17,9 @@ MB_ROLE_KEY = "macblend_role"
 MB_GENERATED_KEY = "macblend_generated_key"
 MB_SCHEMA_KEY = "macblend_schema"
 MB_SCHEMA_VERSION = 2
+TRANSFORM_NODE_VERTICAL_SHIFT = 300.0
+TRANSFORM_NODE_HORIZONTAL_OFFSET = 300.0
+TRANSFORM_NODE_FIXED_HEIGHT = 200.0
 
 
 def _mark_owned(data_block, role, generated_key):
@@ -281,6 +285,20 @@ def build_matrix_node_group(tree_type):
         if not _is_owned(group, 'matrix_group', group_key):
             continue
         if group.get(MB_SCHEMA_KEY) == MB_SCHEMA_VERSION and _group_is_usable(group):
+            input_node = next(
+                (node for node in group.nodes if node.bl_idname == 'NodeGroupInput'),
+                None,
+            )
+            output_node = next(
+                (node for node in group.nodes if node.bl_idname == 'NodeGroupOutput'),
+                None,
+            )
+            if input_node is not None and output_node is not None:
+                input_node.location = (-800, 0)
+                output_node.location = (800, 0)
+                for node in group.nodes:
+                    if node not in {input_node, output_node}:
+                        node.hide = True
             return group
 
     if tree_type == 'SHADER':
@@ -358,13 +376,17 @@ def build_matrix_node_group(tree_type):
         group.links.new(sep_img.outputs['Alpha'], combine.inputs['Alpha'])
     group.links.new(combine.outputs[0], out_node.inputs['Image'])
 
-    in_node.location = (-300, 0)
-    out_node.location = (300, 0)
+    in_node.location = (-800, 0)
+    out_node.location = (800, 0)
     sep_img.location = (-520, 360)
     sep_m_r.location = (-520, 120)
     sep_m_g.location = (-520, -120)
     sep_m_b.location = (-520, -360)
     combine.location = (520, 0)
+
+    for node in group.nodes:
+        if node not in {in_node, out_node}:
+            node.hide = True
     return group
 
 
@@ -702,8 +724,86 @@ def _create_matrix_node(tree, editor_kind, node_name, matrix_3x3, *, label_text,
     return node
 
 
+def _update_matrix_node_values(node, matrix_3x3):
+    row_values = (
+        (float(matrix_3x3[0, 0]), float(matrix_3x3[0, 1]), float(matrix_3x3[0, 2])),
+        (float(matrix_3x3[1, 0]), float(matrix_3x3[1, 1]), float(matrix_3x3[1, 2])),
+        (float(matrix_3x3[2, 0]), float(matrix_3x3[2, 1]), float(matrix_3x3[2, 2])),
+    )
+    for socket_name, row_value in zip(('Output Red', 'Output Green', 'Output Blue'), row_values):
+        socket = node.inputs.get(socket_name)
+        if socket is not None:
+            socket.default_value = row_value
+
+
+def _update_exposure_node_value(exposure_node, editor_kind, scale_value):
+    if editor_kind == 'COMPOSITOR':
+        exposure_node.inputs[1].default_value = math.log2(max(float(scale_value), 1e-8))
+    else:
+        _set_vector_math_scale_value(exposure_node, scale_value)
+
+
+def _numbered_node_name(tree, base_name):
+    if tree.nodes.get(base_name) is None:
+        return base_name
+    suffix = 1
+    while tree.nodes.get(f'{base_name}.{suffix:03d}') is not None:
+        suffix += 1
+    return f'{base_name}.{suffix:03d}'
+
+
 def _mode_node_name(base_name, mode):
     return f"{base_name}{mode}"
+
+
+def _node_editor_view_center(context):
+    area = getattr(context, 'area', None)
+    window_region = next(
+        (region for region in getattr(area, 'regions', ()) if region.type == 'WINDOW'),
+        None,
+    )
+    view2d = getattr(window_region, 'view2d', None)
+    if view2d is None or not hasattr(view2d, 'region_to_view'):
+        return 0.0, 0.0, 1.0
+
+    center_x, center_y = view2d.region_to_view(
+        window_region.width * 0.5,
+        window_region.height * 0.5,
+    )
+    bottom_y = view2d.region_to_view(0.0, 0.0)[1]
+    top_y = view2d.region_to_view(0.0, window_region.height)[1]
+    y_direction = 1.0 if top_y > bottom_y else -1.0
+    return center_x, center_y, y_direction
+
+
+def _node_dimensions(node):
+    dimensions = getattr(node, 'dimensions', None)
+    width = float(getattr(dimensions, 'x', 0.0) or getattr(node, 'width', 0.0))
+    height = float(getattr(dimensions, 'y', 0.0) or getattr(node, 'height', 0.0))
+    return width, height
+
+
+def _center_transform_nodes(context, matrix_node, exposure_node=None, horizontal_offset=0.0):
+    center_x, center_y, y_direction = _node_editor_view_center(context)
+    matrix_width, _matrix_height = _node_dimensions(matrix_node)
+    if exposure_node is None:
+        total_width = matrix_width
+    else:
+        exposure_width, _exposure_height = _node_dimensions(exposure_node)
+        total_width = matrix_width + 100.0 + exposure_width
+
+    matrix_x = center_x - total_width * 0.5 + horizontal_offset
+    matrix_y = (
+        center_y
+        - y_direction * TRANSFORM_NODE_FIXED_HEIGHT * 0.5
+        + y_direction * TRANSFORM_NODE_VERTICAL_SHIFT
+    )
+    matrix_node.location = (matrix_x, matrix_y)
+    if exposure_node is not None:
+        exposure_node.location = (
+            matrix_x + matrix_width + 100.0,
+            matrix_y,
+        )
 
 
 def _sync_exposure_node(tree, editor_kind, matrix_node, scale_value, enabled):
@@ -760,6 +860,163 @@ def _sync_exposure_node(tree, editor_kind, matrix_node, scale_value, enabled):
     return exp_node
 
 
+def _selected_transform_source(tree, editor_kind):
+    selected_nodes = [node for node in tree.nodes if node.select]
+    active_node = getattr(tree.nodes, 'active', None)
+    if len(selected_nodes) == 1:
+        candidates = selected_nodes
+    else:
+        candidates = []
+        selected_set = set(selected_nodes)
+        for node in selected_nodes:
+            if editor_kind == 'COMPOSITOR':
+                output_socket = node.outputs.get('Image')
+            else:
+                output_socket = node.outputs.get('Color')
+                if output_socket is None:
+                    output_socket = next(
+                        (
+                            socket for socket in node.outputs
+                            if getattr(socket, 'type', None) in {'RGBA', 'COLOR'}
+                        ),
+                        None,
+                    )
+            if output_socket is None:
+                continue
+            if not any(link.to_node in selected_set for link in output_socket.links):
+                candidates.append(node)
+
+    for node in candidates:
+        if editor_kind == 'COMPOSITOR':
+            output_socket = node.outputs.get('Image')
+        else:
+            output_socket = node.outputs.get('Color')
+            if output_socket is None:
+                output_socket = next(
+                    (
+                        socket for socket in node.outputs
+                        if getattr(socket, 'type', None) in {'RGBA', 'COLOR'}
+                    ),
+                    None,
+                )
+        if output_socket is not None:
+            return node, output_socket
+    return None
+
+
+def _insert_transform_after_selected_node(tree, editor_kind, matrix_node, exposure_node=None, source=None):
+    if source is None:
+        return False
+    _source_node, source_socket = source
+
+    downstream = [
+        (link.to_socket, link)
+        for link in tuple(source_socket.links)
+        if link.to_node not in {matrix_node, exposure_node}
+    ]
+    for _to_socket, link in downstream:
+        tree.links.remove(link)
+
+    tree.links.new(source_socket, matrix_node.inputs['Image'])
+    output_socket = exposure_node.outputs[0] if exposure_node is not None else matrix_node.outputs['Image']
+    for to_socket, _link in downstream:
+        tree.links.new(output_socket, to_socket)
+    return True
+
+
+def _place_transform_after_selected_node(source_node, matrix_node, exposure_node=None):
+    source_width, _source_height = _node_dimensions(source_node)
+    matrix_width, _matrix_height = _node_dimensions(matrix_node)
+    matrix_node.location = (
+        source_node.location[0] + source_width + 100.0,
+        source_node.location[1],
+    )
+    if exposure_node is not None:
+        exposure_node.location = (
+            matrix_node.location[0] + matrix_width + 100.0,
+            matrix_node.location[1],
+        )
+
+
+def _execute_transform(operator, context, mode, *, update_existing=False):
+    settings, editor_kind, tree, matrix_3x3, _normalization_factor = _prepare_calibration_data(
+        operator,
+        context,
+    )
+    if settings is None:
+        return {'CANCELLED'}
+
+    if mode == 'INVERSE':
+        try:
+            matrix_3x3 = np.linalg.inv(matrix_3x3)
+        except np.linalg.LinAlgError:
+            operator.report({'ERROR'}, "Calculated matrix is singular and cannot be inverted.")
+            return {'CANCELLED'}
+
+    base_name = _mode_node_name(settings.node_name, mode.title())
+    existing_node = _find_owned_node(tree, 'matrix', base_name)
+    if update_existing and existing_node is not None:
+        _update_matrix_node_values(existing_node, matrix_3x3)
+        exposure_key = f"{existing_node.get(MB_GENERATED_KEY, existing_node.name)}:exposure"
+        existing_exposure = _find_owned_node(tree, 'exposure', exposure_key)
+        exposure_value = (
+            settings.normalization_factor
+            if mode == 'FORWARD'
+            else 1.0 / max(float(settings.normalization_factor), 1e-8)
+        )
+        if settings.create_exposure_node and existing_exposure is None:
+            existing_exposure = _sync_exposure_node(
+                tree,
+                editor_kind,
+                existing_node,
+                exposure_value,
+                True,
+            )
+        elif existing_exposure is not None and settings.create_exposure_node:
+            _update_exposure_node_value(existing_exposure, editor_kind, exposure_value)
+        operator.report({'INFO'}, f"Updated matrix values in '{existing_node.name}'.")
+        return {'FINISHED'}
+
+    selected_source = _selected_transform_source(tree, editor_kind)
+    node_name = _numbered_node_name(tree, base_name)
+    matrix_node = _create_matrix_node(
+        tree,
+        editor_kind,
+        node_name,
+        matrix_3x3,
+        label_text=mode.title(),
+        location=(300, -150 if mode == 'FORWARD' else 150),
+    )
+    exposure_node = _sync_exposure_node(
+        tree,
+        editor_kind,
+        matrix_node,
+        settings.normalization_factor if mode == 'FORWARD' else 1.0 / max(float(settings.normalization_factor), 1e-8),
+        settings.create_exposure_node,
+    )
+    if _insert_transform_after_selected_node(
+        tree,
+        editor_kind,
+        matrix_node,
+        exposure_node,
+        selected_source,
+    ):
+        _place_transform_after_selected_node(selected_source[0], matrix_node, exposure_node)
+    else:
+        _center_transform_nodes(
+            context,
+            matrix_node,
+            exposure_node,
+            horizontal_offset=(
+                -TRANSFORM_NODE_HORIZONTAL_OFFSET
+                if mode == 'FORWARD'
+                else TRANSFORM_NODE_HORIZONTAL_OFFSET
+            ),
+        )
+    operator.report({'INFO'}, f"Created {mode.title().lower()} matrix '{node_name}' with optional exposure scaling.")
+    return {'FINISHED'}
+
+
 class MB_OT_ForwardTransform(bpy.types.Operator):
     bl_idname = "macblend.forward_transform"
     bl_label = "Forward"
@@ -771,29 +1028,25 @@ class MB_OT_ForwardTransform(bpy.types.Operator):
         return _target_is_selected(context)
 
     def execute(self, context):
-        settings, editor_kind, tree, matrix_3x3, normalization_factor = _prepare_calibration_data(self, context)
+        settings, _editor_kind, tree, _matrix_3x3, _normalization_factor = _prepare_calibration_data(
+            self,
+            context,
+        )
         if settings is None:
             return {'CANCELLED'}
-
         forward_name = _mode_node_name(settings.node_name, 'Forward')
-        forward_node = _create_matrix_node(
-            tree,
-            editor_kind,
-            forward_name,
-            matrix_3x3,
-            label_text='Forward',
-            location=(300, -150),
-        )
-        _sync_exposure_node(
-            tree,
-            editor_kind,
-            forward_node,
-            settings.normalization_factor,
-            settings.create_exposure_node,
-        )
-
-        self.report({'INFO'}, f"Created forward matrix '{forward_name}' with optional exposure scaling.")
-        return {'FINISHED'}
+        existing_node = _find_owned_node(tree, 'matrix', forward_name)
+        if existing_node is not None:
+            exposure_key = f"{existing_node.get(MB_GENERATED_KEY, existing_node.name)}:exposure"
+            existing_exposure = _find_owned_node(tree, 'exposure', exposure_key)
+            bpy.ops.macblend.confirm_transform(
+                'INVOKE_DEFAULT',
+                mode='FORWARD',
+                matrix_name=existing_node.name,
+                exposure_name=existing_exposure.name if existing_exposure is not None else '',
+            )
+            return {'FINISHED'}
+        return _execute_transform(self, context, 'FORWARD')
 
 
 class MB_OT_InverseTransform(bpy.types.Operator):
@@ -807,30 +1060,90 @@ class MB_OT_InverseTransform(bpy.types.Operator):
         return _target_is_selected(context)
 
     def execute(self, context):
-        settings, editor_kind, tree, matrix_3x3, normalization_factor = _prepare_calibration_data(self, context)
+        settings, _editor_kind, tree, _matrix_3x3, _normalization_factor = _prepare_calibration_data(
+            self,
+            context,
+        )
         if settings is None:
             return {'CANCELLED'}
-
-        try:
-            inverse_matrix = np.linalg.inv(matrix_3x3)
-        except np.linalg.LinAlgError:
-            self.report({'ERROR'}, "Calculated matrix is singular and cannot be inverted.")
-            return {'CANCELLED'}
-
         inverse_name = _mode_node_name(settings.node_name, 'Inverse')
-        inverse_node = _create_matrix_node(
-            tree,
-            editor_kind,
-            inverse_name,
-            inverse_matrix,
-            label_text='Inverse',
-            location=(300, 150),
-        )
-        inverse_factor = 1.0 / max(float(settings.normalization_factor), 1e-8)
-        _sync_exposure_node(tree, editor_kind, inverse_node, inverse_factor, settings.create_exposure_node)
+        existing_node = _find_owned_node(tree, 'matrix', inverse_name)
+        if existing_node is not None:
+            exposure_key = f"{existing_node.get(MB_GENERATED_KEY, existing_node.name)}:exposure"
+            existing_exposure = _find_owned_node(tree, 'exposure', exposure_key)
+            bpy.ops.macblend.confirm_transform(
+                'INVOKE_DEFAULT',
+                mode='INVERSE',
+                matrix_name=existing_node.name,
+                exposure_name=existing_exposure.name if existing_exposure is not None else '',
+            )
+            return {'FINISHED'}
+        return _execute_transform(self, context, 'INVERSE')
 
-        self.report({'INFO'}, f"Created inverse matrix '{inverse_name}' with optional exposure scaling.")
-        return {'FINISHED'}
+
+class MB_OT_ConfirmTransform(bpy.types.Operator):
+    bl_idname = 'macblend.confirm_transform'
+    bl_label = 'Transform Already Exists'
+
+    mode: EnumProperty(
+        name='Transform',
+        items=(('FORWARD', 'Forward', ''), ('INVERSE', 'Inverse', '')),
+        options={'HIDDEN'},
+    )
+    matrix_name: StringProperty(options={'HIDDEN'})
+    exposure_name: StringProperty(options={'HIDDEN'})
+    action: EnumProperty(
+        name='Action',
+        items=(
+            ('UPDATE', 'Update existing', 'Only update the ColorMatrix input vectors'),
+            (
+                'NEW',
+                'Create new',
+                'Preserve the existing nodes and add a .001-style suffix to avoid name conflicts',
+            ),
+        ),
+        default='UPDATE',
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+        settings = getattr(context.scene, 'macblend_calibrator_settings', None)
+        exposure_enabled = bool(settings and settings.create_exposure_node)
+        exposure_text = ' and Exposure' if self.exposure_name and exposure_enabled else ''
+        message = f"A ColorMatrix{exposure_text} node with this name already exists:"
+        message_column = layout.column(align=True)
+        for line in textwrap.wrap(message, width=64):
+            message_column.label(text=line)
+        names_box = layout.box()
+        names_box.label(text=f"ColorMatrix: {self.matrix_name}")
+        if self.exposure_name and exposure_enabled:
+            names_box.label(text=f"Exposure: {self.exposure_name}")
+        if exposure_enabled and not self.exposure_name:
+            warning_row = layout.row()
+            warning_row.alert = True
+            warning_column = warning_row.column(align=True)
+            for line in textwrap.wrap(
+                'Exposure creation is enabled, but no matching Exposure node was found. '
+                'Update existing will add one and insert it into the existing output path.',
+                width=64,
+            ):
+                warning_column.label(text=line, icon='ERROR')
+        if self.exposure_name and not exposure_enabled:
+            notice_column = layout.column(align=True)
+            for line in textwrap.wrap(
+                'An existing Exposure Node was found, but will be left unchanged. '
+                'To update it, enable Create Exposure Node and run the operation again.',
+                width=64,
+            ):
+                notice_column.label(text=line)
+        layout.label(text="Choose an action:")
+        layout.prop(self, 'action', expand=True)
+
+    def execute(self, context):
+        return _execute_transform(self, context, self.mode, update_existing=self.action == 'UPDATE')
 
 
 class MB_OT_ExportLuts(bpy.types.Operator):
@@ -956,6 +1269,7 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
 classes = (
     MB_OT_ForwardTransform,
     MB_OT_InverseTransform,
+    MB_OT_ConfirmTransform,
     MB_OT_ExportLuts,
     MB_OT_ConfirmLutOverwrite,
     MB_PT_CalibrationPanel,
