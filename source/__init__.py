@@ -114,6 +114,15 @@ def _update_gizmo_scale(_preferences, _context):
 class MacBlendCalibratorPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
 
+    default_chart_type: EnumProperty(
+        name="Chart Type",
+        description="Default target color chart for newly initialized overlays",
+        items=(
+            ('0', "ColorChecker Classic (after 2014)", "X-Rite / Calibrite ColorChecker Classic (post-2014 reference)"),
+            ('1', "SpyderCheckr 24", "Datacolor SpyderCheckr 24"),
+        ),
+        default='0',
+    )
     default_patch_size: IntProperty(
         name="Patch Size",
         description="Default Macbeth patch sample size in image pixels",
@@ -175,6 +184,7 @@ class MacBlendCalibratorPreferences(bpy.types.AddonPreferences):
         sampling_defaults = primary_defaults.column(align=True)
         sampling_defaults.ui_units_x = 15
         sampling_defaults.label(text="Sampling")
+        sampling_defaults.prop(self, "default_chart_type")
         sampling_defaults.prop(self, "default_patch_size", slider=True)
         sampling_defaults.prop(self, "default_overlay_opacity", slider=True)
         sampling_defaults.prop(self, "gizmo_scale")

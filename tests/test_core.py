@@ -252,5 +252,52 @@ class ReferenceValueTests(unittest.TestCase):
             core.build_reference_values('LINEAR_SRGB_D65')
 
 
+class ChartProfileTests(unittest.TestCase):
+    def test_profiles_exist_and_have_expected_identifiers(self):
+        macbeth = core.get_chart_profile('0')
+        spyder = core.get_chart_profile('1')
+
+        self.assertEqual(macbeth.identifier, '0')
+        self.assertEqual(macbeth.label, 'ColorChecker Classic (after 2014)')
+        self.assertEqual(macbeth.columns, 6)
+        self.assertEqual(macbeth.rows, 4)
+        self.assertEqual(len(macbeth.patch_names), 24)
+        self.assertEqual(macbeth.neutral_patch_index, 21)
+
+        self.assertEqual(spyder.identifier, '1')
+        self.assertEqual(spyder.label, 'SpyderCheckr 24')
+        self.assertEqual(spyder.columns, 6)
+        self.assertEqual(spyder.rows, 4)
+        self.assertEqual(len(spyder.patch_names), 24)
+        self.assertEqual(spyder.neutral_patch_index, 21)
+
+    def test_spydercheckr_grid_uv_coordinates_follow_six_by_four_layout(self):
+        # Top-left cell (A1)
+        np.testing.assert_allclose(core.chart_patch_uv(0, chart_type='1'), (0.5 / 6.0, 1.0 - 0.5 / 4.0))
+        # Top-right cell (F1)
+        np.testing.assert_allclose(core.chart_patch_uv(5, chart_type='1'), (5.5 / 6.0, 1.0 - 0.5 / 4.0))
+        # Bottom-left cell (A4)
+        np.testing.assert_allclose(core.chart_patch_uv(18, chart_type='1'), (0.5 / 6.0, 0.5 / 4.0))
+        # Bottom-right cell (F4)
+        np.testing.assert_allclose(core.chart_patch_uv(23, chart_type='1'), (5.5 / 6.0, 0.5 / 4.0))
+
+    def test_unknown_chart_type_defaults_to_macbeth(self):
+        profile = core.get_chart_profile('999')
+        self.assertEqual(profile.identifier, '0')
+
+    def test_spydercheckr_reference_values_differ_from_macbeth(self):
+        macbeth_ref = core.build_reference_values('REC709', chart_type='0')
+        spyder_ref = core.build_reference_values('REC709', chart_type='1')
+
+        self.assertEqual(macbeth_ref.shape, (24, 3))
+        self.assertEqual(spyder_ref.shape, (24, 3))
+        self.assertFalse(np.allclose(macbeth_ref, spyder_ref))
+
+    def test_matrix_calculation_succeeds_with_spydercheckr_reference(self):
+        ref = core.build_reference_values('REC709', chart_type='1')
+        result = core.calculate_matrix_result(ref, ref)
+        np.testing.assert_allclose(result.matrix, np.eye(3), atol=1e-6)
+
+
 if __name__ == "__main__":
     unittest.main()

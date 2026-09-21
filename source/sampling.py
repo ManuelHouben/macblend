@@ -131,6 +131,58 @@ MB_MACBETH_PATCH_NAMES = (
 )
 MB_CCMASTER = tuple((slot, name) for slot, name in enumerate(MB_MACBETH_PATCH_NAMES))
 
+
+def _linear_to_srgb_tuple(rgb):
+    def convert(val):
+        val = float(val)
+        if val <= 0.0031308:
+            s = 12.92 * val
+        else:
+            s = 1.055 * (val ** (1.0 / 2.4)) - 0.055
+        return float(np.clip(s, 0.0, 1.0))
+    return tuple(convert(c) for c in rgb[:3])
+
+
+SPYDERCHECKR24_REFERENCE_SRGB = tuple(
+    _linear_to_srgb_tuple(v)
+    for v in core.build_reference_values('REC709', chart_type='1')
+)
+
+SPYDERCHECKR24_GRID_TO_CANONICAL = (
+    5, 4, 3, 2, 1, 0,
+    6, 7, 8, 9, 10, 11,
+    17, 16, 15, 14, 13, 12,
+    18, 19, 20, 21, 22, 23,
+)
+
+
+def grid_slot_to_canonical_slot(grid_slot, chart_type='0'):
+    if str(chart_type) == '1' and 0 <= grid_slot < 24:
+        return SPYDERCHECKR24_GRID_TO_CANONICAL[grid_slot]
+    return grid_slot
+
+
+def get_chart_reference_srgb(chart_type='0'):
+    if str(chart_type) == '1':
+        return SPYDERCHECKR24_REFERENCE_SRGB
+    return MB_MACBETH_REFERENCE_SRGB
+
+
+def get_chart_patch_names(chart_type='0'):
+    profile = core.get_chart_profile(chart_type)
+    return profile.patch_names
+
+
+def get_ccmaster(chart_type='0'):
+    patch_names = get_chart_patch_names(chart_type)
+    return tuple((slot, name) for slot, name in enumerate(patch_names))
+
+
+def _chart_type_changed(data, context):
+    image = getattr(data, 'id_data', None)
+    _invalidate_calibrations_for_image(image)
+    _tag_image_editor_redraw()
+
 MB_SAMPLE_PROPERTY_NAMES = tuple(f"sample_patch_{index + 1:02d}" for index in range(24))
 _MB_SYNCING_SAMPLE_SELECTION = False
 _MB_SYNCING_SAMPLE_VALUES = False
@@ -158,8 +210,8 @@ def _corner_target_point(corners, corner_idx):
     return corners[corner_idx]
 
 
-def _flip_arrow_geometry(homography):
-    first_patch_u, first_patch_v = core.chart_patch_uv(0)
+def _flip_arrow_geometry(homography, chart_type='0'):
+    first_patch_u, first_patch_v = core.chart_patch_uv(0, chart_type=chart_type)
     horizontal_v = 2.0 - first_patch_v
     vertical_u = -first_patch_u
     mapped = core.map_chart_points(
@@ -215,30 +267,36 @@ def _draw_image_editor_overlay():
     except ValueError:
         return
 
+    chart_type = getattr(data, 'chart_type', '0')
+    ref_srgb = get_chart_reference_srgb(chart_type)
+    ccmaster = get_ccmaster(chart_type)
+
     samples_by_slot = {
         int(sample.patch_index): sample
         for sample in data.samples
-        if 0 <= int(sample.patch_index) < len(MB_CCMASTER)
+        if 0 <= int(sample.patch_index) < len(ccmaster)
     }
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
     overlay_alpha = min(float(data.overlay_opacity), MB_OVERLAY_RENDER_ALPHA_MAX)
     gpu.state.blend_set('ALPHA')
     try:
-        for index in range(len(MB_CCMASTER)):
+        for index in range(len(ccmaster)):
+            canonical_index = grid_slot_to_canonical_slot(index, chart_type)
             footprint = core.chart_patch_footprint(
                 homography,
                 index,
                 patch_size,
                 chart_size=chart_size,
+                chart_type=chart_type,
             )
             region_points = [_region_point(context, point) for point in footprint]
             if any(point is None for point in region_points):
                 continue
 
-            if index in samples_by_slot:
-                fill_color = _linear_to_srgb(samples_by_slot[index].rgb)
+            if canonical_index in samples_by_slot:
+                fill_color = _linear_to_srgb(samples_by_slot[canonical_index].rgb)
             else:
-                fill_color = MB_MACBETH_REFERENCE_SRGB[index]
+                fill_color = ref_srgb[canonical_index]
             shader.uniform_float('color', (*fill_color, overlay_alpha))
             batch_for_shader(
                 shader,
@@ -246,7 +304,7 @@ def _draw_image_editor_overlay():
                 {'pos': (region_points[0], region_points[1], region_points[2], region_points[0], region_points[2], region_points[3])},
             ).draw(shader)
 
-            shader.uniform_float('color', (*MB_MACBETH_REFERENCE_SRGB[index], 1.0))
+            shader.uniform_float('color', (*ref_srgb[canonical_index], 1.0))
             batch_for_shader(
                 shader,
                 'LINES',
@@ -341,11 +399,14 @@ def _sample_patch_value_changed(sample_idx):
 
 def image_has_sample_values(image):
     data = getattr(image, 'mb_sample_data', None)
-    if data is None or len(data.samples) != len(MB_CCMASTER):
+    if data is None:
+        return False
+    ccmaster = get_ccmaster(getattr(data, 'chart_type', '0'))
+    if len(data.samples) != len(ccmaster):
         return False
 
     patch_indices = {int(getattr(sample, 'patch_index', -1)) for sample in data.samples}
-    return patch_indices == set(range(len(MB_CCMASTER)))
+    return patch_indices == set(range(len(ccmaster)))
 
 
 def _image_index(image):
@@ -418,21 +479,20 @@ def _active_sample_image_changed(ui_state, context):
     _tag_image_editor_redraw()
 
 
-def _ccmaster_patch_uv(slot):
-    row = slot // 6
-    col = slot % 6
-    u = (col + 0.5) / 6.0
-    v = 1.0 - (row + 0.5) / 4.0
-    return u, v
+def _ccmaster_patch_uv(slot, chart_type='0'):
+    return core.chart_patch_uv(slot, chart_type=chart_type)
 
 
-def _calculate_ccmaster_patch_centers(corners):
+def _calculate_ccmaster_patch_centers(corners, chart_type='0'):
     homography = core.build_chart_homography(corners)
     centers = []
-    for slot, patch_name in MB_CCMASTER:
-        u, v = _ccmaster_patch_uv(slot)
+    patch_names = get_chart_patch_names(chart_type)
+    for grid_slot in range(24):
+        canonical_slot = grid_slot_to_canonical_slot(grid_slot, chart_type)
+        patch_name = patch_names[canonical_slot]
+        u, v = core.chart_patch_uv(grid_slot, chart_type=chart_type)
         center_x, center_y = core.map_chart_point(homography, u, v)
-        centers.append((slot, patch_name, center_x, center_y))
+        centers.append((grid_slot, canonical_slot, patch_name, center_x, center_y))
     return centers
 
 
@@ -444,9 +504,13 @@ def _chart_sample_geometry(corners, image_size, patch_size):
 
 def _store_patch_centers(data, centers):
     data.patch_centers.clear()
-    for slot, patch_name, center_x, center_y in centers:
+    for item in centers:
+        canonical_slot = item[1] if len(item) >= 5 else item[0]
+        patch_name = item[2] if len(item) >= 5 else item[1]
+        center_x = item[3] if len(item) >= 5 else item[2]
+        center_y = item[4] if len(item) >= 5 else item[3]
         patch = data.patch_centers.add()
-        patch.slot = slot
+        patch.slot = canonical_slot
         patch.patch_name = patch_name
         patch.x = center_x
         patch.y = center_y
@@ -703,8 +767,8 @@ def _chart_sanity_check_findings(image, data, action):
     if action == MB_SANITY_ACTION_SAMPLE:
         chart_size, patch_size = _chart_sample_geometry(corners, image.size, data.patch_size)
         out_of_bounds = 0
-        for slot in range(len(MB_CCMASTER)):
-            footprint = core.chart_patch_footprint(homography, slot, patch_size, chart_size=chart_size)
+        for slot in range(len(get_ccmaster(data.chart_type))):
+            footprint = core.chart_patch_footprint(homography, slot, patch_size, chart_size=chart_size, chart_type=data.chart_type)
             if np.any(footprint < 0.0) or np.any(footprint > 1.0):
                 out_of_bounds += 1
         if out_of_bounds:
@@ -796,11 +860,15 @@ def _center_overlay_corners(
     image_height,
     center=(0.5, 0.5),
     view_size=(1.0, 1.0),
-    chart_aspect_ratio=MB_CHART_ASPECT_RATIO,
+    chart_aspect_ratio=None,
     area_fraction=MB_CHART_AREA_FRACTION,
 ):
     if image_width <= 0 or image_height <= 0:
         return
+
+    if chart_aspect_ratio is None:
+        profile = core.get_chart_profile(getattr(data, 'chart_type', '0'))
+        chart_aspect_ratio = profile.columns / profile.rows
 
     view_width_px = abs(float(view_size[0])) * float(image_width)
     view_height_px = abs(float(view_size[1])) * float(image_height)
@@ -828,7 +896,8 @@ def _center_overlay_corners(
     data.corner_tr = (center_x + half_width, center_y + half_height)
     data.corner_br = (center_x + half_width, center_y - half_height)
     data.corner_bl = (center_x - half_width, center_y - half_height)
-    data.patch_size = core.chart_patch_size((chart_width_px, chart_height_px))
+    chart_type = getattr(data, 'chart_type', '0')
+    data.patch_size = core.chart_patch_size((chart_width_px, chart_height_px), chart_type=chart_type)
 
 
 def _initialize_overlay(data, image, patch_size=MB_INITIAL_PATCH_SIZE):
@@ -836,9 +905,13 @@ def _initialize_overlay(data, image, patch_size=MB_INITIAL_PATCH_SIZE):
     if width <= 0 or height <= 0:
         return
 
+    if 'chart_type' not in data:
+        data.chart_type = _preference_value('default_chart_type', '0')
+
+    profile = core.get_chart_profile(data.chart_type)
     cell_size = float(patch_size) / core.CHART_PATCH_CELL_RATIO
-    chart_width = cell_size * core.CHART_COLUMNS
-    chart_height = cell_size * core.CHART_ROWS
+    chart_width = cell_size * profile.columns
+    chart_height = cell_size * profile.rows
     fit_scale = min(1.0, width / chart_width, height / chart_height)
     chart_width *= fit_scale
     chart_height *= fit_scale
@@ -849,6 +922,7 @@ def _initialize_overlay(data, image, patch_size=MB_INITIAL_PATCH_SIZE):
         height,
         view_size=(chart_width / width, chart_height / height),
         area_fraction=1.0,
+        chart_aspect_ratio=profile.columns / profile.rows,
     )
 
 
@@ -895,8 +969,10 @@ def _linear_to_srgb(rgb_value):
 
 
 def _reset_sample_patch_values(data):
+    chart_type = getattr(data, 'chart_type', '0')
+    ref_srgb = get_chart_reference_srgb(chart_type)
     for sample_idx, prop_name in enumerate(MB_SAMPLE_PROPERTY_NAMES):
-        setattr(data, prop_name, MB_MACBETH_REFERENCE_SRGB[sample_idx])
+        setattr(data, prop_name, ref_srgb[sample_idx])
 
 
 def _get_patch_size(data):
@@ -1209,7 +1285,7 @@ class MB_GGT_ImageEditorOverlay(bpy.types.GizmoGroup):
             corner_point = _corner_target_point(corners, corner_idx)
             self._set_cross(corner_gizmo, context, corner_point)
 
-        horizontal_arrow, vertical_arrow = _flip_arrow_geometry(homography)
+        horizontal_arrow, vertical_arrow = _flip_arrow_geometry(homography, chart_type=getattr(image.mb_sample_data, 'chart_type', '0'))
         self._set_flip_button(self.flip_buttons[0], context, *horizontal_arrow)
         self._set_flip_button(self.flip_buttons[1], context, *vertical_arrow)
 
@@ -1678,6 +1754,16 @@ class MB_ChartPatchCenter(bpy.types.PropertyGroup):
 class MB_ImageSampleData(bpy.types.PropertyGroup):
     samples: CollectionProperty(type=MB_ColorSample)
     patch_centers: CollectionProperty(type=MB_ChartPatchCenter)
+    chart_type: EnumProperty(
+        name="Chart Type",
+        description="Target color chart model and reference specification",
+        items=(
+            ('0', "ColorChecker Classic (after 2014)", "X-Rite / Calibrite ColorChecker Classic (post-2014 reference)"),
+            ('1', "SpyderCheckr 24", "Datacolor SpyderCheckr 24"),
+        ),
+        default='0',
+        update=_chart_type_changed,
+    )
     patch_size: IntProperty(
         name="Patch Size",
         description="Approximate colored-patch width and height in image pixels",
@@ -1843,7 +1929,7 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
             print("[MacBlend] Sample Chart debug:", flush=True)
 
         try:
-            centers = _calculate_ccmaster_patch_centers(overlay_corners)
+            centers = _calculate_ccmaster_patch_centers(overlay_corners, chart_type=data.chart_type)
             homography = core.build_chart_homography(overlay_corners)
             transfer_started = perf_counter()
             pixel_buffer = _load_image_pixel_buffer(storage_image)
@@ -1858,18 +1944,18 @@ class MB_OT_SampleImageColors(bpy.types.Operator):
                 if source_image is not None
                 else None
             )
-            for slot, patch_name, _center_x, _center_y in centers:
+            for grid_slot, canonical_slot, patch_name, _center_x, _center_y in centers:
                 sample_rgb = core.sample_warped_chart_patch(
                     pixel_buffer,
                     homography,
-                    slot,
+                    grid_slot,
                     sample_size,
                     chart_size=chart_size,
                     panorama_projection=panorama_projection,
                 )
-                sampled_values.append((slot, patch_name, sample_rgb))
+                sampled_values.append((canonical_slot, patch_name, sample_rgb))
                 if debug_logging:
-                    print(f"  slot[{slot}] {patch_name} -> {tuple(float(v) for v in sample_rgb)}", flush=True)
+                    print(f"  grid_slot[{grid_slot}] -> canonical_slot[{canonical_slot}] {patch_name} -> {tuple(float(v) for v in sample_rgb)}", flush=True)
             averaging_seconds = perf_counter() - averaging_started
             if debug_logging:
                 buffer_mib = pixel_buffer.nbytes / (1024.0 * 1024.0)
@@ -1944,6 +2030,7 @@ class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
             projection_data = source_image.mb_sample_data if source_image is not None else data
             colorspace_image = source_image or image
             layout.prop(colorspace_image.colorspace_settings, 'name', text='Color Space')
+            layout.prop(data, 'chart_type', text='Chart Type')
             layout.prop(data, 'patch_size')
             overlay_row = layout.row(align=True)
             overlay_row.prop(data, 'show_overlay')
@@ -2014,14 +2101,16 @@ class MB_PT_ImageEditorSamplePanel(bpy.types.Panel):
 
         selected_image = _peek_selected_sample_image(context.scene)
         display_data = selected_image.mb_sample_data if selected_image is not None else ui_state
+        chart_type = getattr(display_data, 'chart_type', '0')
+        profile = core.get_chart_profile(chart_type)
         box = layout.box()
         box.label(text='Sampled Values')
         samples_col = box.column(align=True)
         samples_col.enabled = selected_image is not None
-        for display_row in range(4):
+        for display_row in range(profile.rows):
             ui_row = samples_col.row(align=True)
-            for col_idx in range(6):
-                sample_idx = display_row * 6 + col_idx
+            for col_idx in range(profile.columns):
+                sample_idx = display_row * profile.columns + col_idx
                 cell = ui_row.column(align=True)
                 cell.prop(display_data, MB_SAMPLE_PROPERTY_NAMES[sample_idx], text='')
 

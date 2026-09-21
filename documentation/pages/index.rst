@@ -5,7 +5,7 @@ MacBlend
    :alt: MacBlend ColorChecker and pipette icon
    :width: 128px
 
-MacBlend calibrates images containing a Macbeth ColorChecker directly in Blender. It samples all 24 chart patches, calculates forward and inverse color transforms, creates compositor or shader nodes, and exports paired ``.cube`` LUTs.
+MacBlend calibrates images containing a ColorChecker directly in Blender. It samples all 24 chart patches, calculates forward and inverse color transforms, creates compositor or shader nodes, and exports paired ``.cube`` LUTs.
 
 MacBlend is hosted on `GitHub <https://github.com/ManuelHouben/macblend>`_. Report bugs and request features through the `issue tracker <https://github.com/ManuelHouben/macblend/issues>`_.
 

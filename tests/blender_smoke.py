@@ -108,12 +108,60 @@ try:
     assert settings.target_colorspace == 'ACESCG'
 
     preference_properties = macblend.MacBlendCalibratorPreferences.bl_rna.properties
+    assert preference_properties['default_chart_type'].default == '0'
     assert preference_properties['default_patch_size'].default == sampling.MB_INITIAL_PATCH_SIZE
     assert np.isclose(preference_properties['default_overlay_opacity'].default, 0.5)
     assert preference_properties['default_normalize_calibration'].default is True
     assert preference_properties['default_create_exposure_node'].default is False
     assert preference_properties['default_lut_size'].default == '33'
     assert preference_properties['default_lut_clamp'].default is False
+
+    chart_image_a = bpy.data.images.new("Chart Image A", width=100, height=100)
+    chart_image_b = bpy.data.images.new("Chart Image B", width=100, height=100)
+    assert chart_image_a.mb_sample_data.chart_type == '0'
+    assert calibration.get_image_chart_type_label(chart_image_a) == "ColorChecker Classic (after 2014)"
+
+    chart_image_b.mb_sample_data.chart_type = '1'
+    assert chart_image_b.mb_sample_data.chart_type == '1'
+    assert calibration.get_image_chart_type_label(chart_image_b) == "SpyderCheckr 24"
+
+    # Verify grid_slot to canonical_slot routing for SpyderCheckr 24
+    assert sampling.grid_slot_to_canonical_slot(0, chart_type='1') == 5
+    assert sampling.grid_slot_to_canonical_slot(5, chart_type='1') == 0
+    assert sampling.grid_slot_to_canonical_slot(12, chart_type='1') == 17
+    assert sampling.grid_slot_to_canonical_slot(17, chart_type='1') == 12
+    assert sampling.grid_slot_to_canonical_slot(21, chart_type='1') == 21
+
+    # Verify chart type change does not alter overlay corner positions
+    corners_before = sampling._get_overlay_corners(chart_image_b.mb_sample_data, chart_image_b)
+    chart_image_b.mb_sample_data.chart_type = '0'
+    corners_after = sampling._get_overlay_corners(chart_image_b.mb_sample_data, chart_image_b)
+    assert corners_before == corners_after
+    chart_image_b.mb_sample_data.chart_type = '1'
+
+    mismatch_scene = bpy.data.scenes.new("Chart Mismatch Test")
+    calib_settings = mismatch_scene.macblend_calibrator_settings
+    calib_settings.sample_source_image = chart_image_a
+    calib_settings.sample_target_image = chart_image_b
+    calib_settings.use_reference_target = False
+
+    for img in (chart_image_a, chart_image_b):
+        img.mb_sample_data.samples.clear()
+        for slot in range(24):
+            sample = img.mb_sample_data.samples.add()
+            sample.patch_index = slot
+            sample.rgb = (0.5, 0.5, 0.5)
+
+    mismatch_reports = []
+    mismatch_op = type("MismatchReporter", (), {"report": lambda self, level, msg: mismatch_reports.append((level, msg))})()
+    mismatch_ctx = type("MismatchCtx", (), {"scene": mismatch_scene})()
+    res = calibration._prepare_calibration_data(mismatch_op, mismatch_ctx, require_editor=False)
+    assert res == (None, None, None, None, None)
+    assert any("does not match" in msg for lvl, msg in mismatch_reports)
+
+    bpy.data.scenes.remove(mismatch_scene)
+    bpy.data.images.remove(chart_image_a)
+    bpy.data.images.remove(chart_image_b)
 
     original_settings_preference = macblend._preference_value
     original_sampling_preference = sampling._preference_value
