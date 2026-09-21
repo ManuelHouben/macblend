@@ -1,13 +1,13 @@
 # Introduction
 
-MacBlend calibrates images from a photographed Macbeth ColorChecker. It compares the chart's 24 measured patches with reference values or a second sampled chart, then fits a single RGB matrix that brings the source closer to the target.
+MacBlend calibrates images from a photographed 24-patch color chart. It supports the ColorChecker Classic (after 2014) and Datacolor SpyderCheckr 24, comparing the chart's measured patches with model-specific reference values or a second sampled chart before fitting a single RGB matrix that brings the source closer to the target.
 
 The transform can be created as compositor or shader nodes, or exported in both directions as `.cube` LUTs.
 
 ## Requirements
 
 - Blender 4.2 or newer
-- A source image containing a visible 6-by-4 Macbeth chart
+- A source image containing a visible 6-by-4 ColorChecker Classic or SpyderCheckr 24 chart
 - Knowledge of how each image was recorded or exported
 
 ## Installation

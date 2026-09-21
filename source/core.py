@@ -40,6 +40,92 @@ MACBETH_D50_TO_D65_CAT02 = np.array([
     [0.001372883562, 0.004445131868, 1.313236713],
 ], dtype=np.float64)
 
+SPYDERCHECKR24_XYZ_D50 = np.array([
+    [0.1113998964, 0.0966807861, 0.0490883941],  # H6 (Dark Skin)
+    [0.3952982368, 0.3553099128, 0.1928659515],  # H5 (Light Skin)
+    [0.1692686551, 0.1858660205, 0.2666809013],  # H4 (Blue Sky)
+    [0.1037198781, 0.1279977883, 0.0523456534],  # H3 (Foliage)
+    [0.2452835592, 0.2348654227, 0.3416765010],  # H2 (Blue Flower)
+    [0.3076822512, 0.4234772396, 0.3374520529],  # H1 (Bluish Green)
+
+    [0.3888763433, 0.2946518384, 0.0431458486],  # G1 (Orange)
+    [0.1172593609, 0.1098191865, 0.2771796138],  # G2 (Purplish Blue)
+    [0.2996723782, 0.1951990129, 0.1039804505],  # G3 (Moderate Red)
+    [0.0917247784, 0.0693130081, 0.1219016829],  # G4 (Purple)
+    [0.3562702838, 0.4446769162, 0.0880911399],  # G5 (Yellow Green)
+    [0.5038320114, 0.4391253963, 0.0603927928],  # G6 (Orange Yellow)
+
+    [0.0669023563, 0.0544993983, 0.2116807502],  # F6 (Blue)
+    [0.1438849866, 0.2259240844, 0.0741006071],  # F5 (Green)
+    [0.2194131115, 0.1230703602, 0.0384412857],  # F4 (Red)
+    [0.6242483660, 0.6326192430, 0.0712084288],  # F3 (Yellow)
+    [0.2990686680, 0.1930314394, 0.2271268085],  # F2 (Magenta)
+    [0.1208589631, 0.1795378021, 0.2854043683],  # F1 (Cyan)
+
+    [0.8886310787, 0.9226861820, 0.7490419119],  # E1 (White 9.5)
+    [0.5669540573, 0.5894253744, 0.4798162851],  # E2 (Neutral 8)
+    [0.3432548507, 0.3572595422, 0.2897947815],  # E3 (Neutral 6.5)
+    [0.1838367508, 0.1913948585, 0.1556906989],  # E4 (Neutral 5)
+    [0.0807065939, 0.0838392766, 0.0677486804],  # E5 (Neutral 3.5)
+    [0.0248551698, 0.0258980980, 0.0222499522],  # E6 (Black 2)
+], dtype=np.float64)
+
+MACBETH_PATCH_NAMES = (
+    "Dark Skin", "Light Skin", "Blue Sky", "Foliage", "Blue Flower", "Bluish Green",
+    "Orange", "Purplish Blue", "Moderate Red", "Purple", "Yellow Green", "Orange Yellow",
+    "Blue", "Green", "Red", "Yellow", "Magenta", "Cyan",
+    "White 9.5", "Neutral 8", "Neutral 6.5", "Neutral 5", "Neutral 3.5", "Black 2",
+)
+
+SPYDERCHECKR24_PATCH_NAMES = (
+    "H6 (Dark Skin)", "H5 (Light Skin)", "H4 (Blue Sky)", "H3 (Foliage)", "H2 (Blue Flower)", "H1 (Bluish Green)",
+    "G1 (Orange)", "G2 (Purplish Blue)", "G3 (Moderate Red)", "G4 (Purple)", "G5 (Yellow Green)", "G6 (Orange Yellow)",
+    "F6 (Blue)", "F5 (Green)", "F4 (Red)", "F3 (Yellow)", "F2 (Magenta)", "F1 (Cyan)",
+    "E1 (White 9.5)", "E2 (Neutral 8)", "E3 (Neutral 6.5)", "E4 (Neutral 5)", "E5 (Neutral 3.5)", "E6 (Black 2)",
+)
+
+
+@dataclass(frozen=True)
+class ChartProfile:
+    identifier: str
+    label: str
+    columns: int
+    rows: int
+    chart_size: tuple
+    xyz_d50: np.ndarray
+    patch_names: tuple
+    neutral_patch_index: int
+
+
+CHART_PROFILES = {
+    '0': ChartProfile(
+        identifier='0',
+        label='ColorChecker Classic (after 2014)',
+        columns=CHART_COLUMNS,
+        rows=CHART_ROWS,
+        chart_size=CHART_SIZE,
+        xyz_d50=MACBETH_XYZ_D50,
+        patch_names=MACBETH_PATCH_NAMES,
+        neutral_patch_index=21,
+    ),
+    '1': ChartProfile(
+        identifier='1',
+        label='SpyderCheckr 24',
+        columns=CHART_COLUMNS,
+        rows=CHART_ROWS,
+        chart_size=CHART_SIZE,
+        xyz_d50=SPYDERCHECKR24_XYZ_D50,
+        patch_names=SPYDERCHECKR24_PATCH_NAMES,
+        neutral_patch_index=21,
+    ),
+}
+
+DEFAULT_CHART_PROFILE = CHART_PROFILES['0']
+
+
+def get_chart_profile(chart_type='0'):
+    return CHART_PROFILES.get(str(chart_type), DEFAULT_CHART_PROFILE)
+
 REFERENCE_GAMUTS = (
     ('ACES', 'ACES', (
         (1.062366107, 0.008406953654, -0.01665578963),
@@ -119,12 +205,13 @@ REFERENCE_GAMUT_MATRICES = {
 }
 
 
-def build_reference_values(gamut):
+def build_reference_values(gamut, chart_type='0'):
     try:
         xyz_to_rgb = REFERENCE_GAMUT_MATRICES[gamut]
     except KeyError as exc:
         raise ValueError(f"Unknown reference gamut: {gamut}") from exc
-    xyz_d65 = MACBETH_XYZ_D50 @ MACBETH_D50_TO_D65_CAT02.T
+    profile = get_chart_profile(chart_type)
+    xyz_d65 = profile.xyz_d50 @ MACBETH_D50_TO_D65_CAT02.T
     return xyz_d65 @ xyz_to_rgb.T
 
 
@@ -493,11 +580,15 @@ def angular_size_at_distance(angular_width, distance):
     return float(width) if np.isfinite(width) else None
 
 
-def chart_patch_size(chart_size, *, maximum=200):
+def chart_patch_size(chart_size, chart_type='0', *, columns=None, rows=None, maximum=200):
     chart_width, chart_height = chart_size
     if chart_width <= 0 or chart_height <= 0:
         raise ValueError("Rectified chart dimensions must be positive.")
-    nominal_cell_size = min(chart_width / CHART_COLUMNS, chart_height / CHART_ROWS)
+    if columns is None or rows is None:
+        profile = get_chart_profile(chart_type)
+        columns = profile.columns
+        rows = profile.rows
+    nominal_cell_size = min(chart_width / columns, chart_height / rows)
     return max(1, min(int(maximum), int(round(nominal_cell_size * CHART_PATCH_CELL_RATIO))))
 
 
@@ -506,22 +597,34 @@ def effective_patch_size(patch_size, image_size, *, maximum=200):
     return max(1, min(int(patch_size), int(maximum), int(max(image_width, image_height))))
 
 
-def chart_patch_uv(slot):
-    if not 0 <= int(slot) < 24:
-        raise ValueError("Macbeth patch slot must be between 0 and 23.")
-    row, column = divmod(int(slot), CHART_COLUMNS)
+def chart_patch_uv(slot, chart_type='0', *, columns=None, rows=None):
+    if columns is None or rows is None:
+        profile = get_chart_profile(chart_type)
+        columns = profile.columns
+        rows = profile.rows
+    num_patches = columns * rows
+    if not 0 <= int(slot) < num_patches:
+        raise ValueError(f"Patch slot must be between 0 and {num_patches - 1}.")
+    row, column = divmod(int(slot), columns)
     return (
-        (column + 0.5) / CHART_COLUMNS,
-        1.0 - (row + 0.5) / CHART_ROWS,
+        (column + 0.5) / columns,
+        1.0 - (row + 0.5) / rows,
     )
 
 
-def chart_patch_footprint(homography, slot, patch_size, chart_size=CHART_SIZE):
+def chart_patch_footprint(homography, slot, patch_size, chart_size=None, chart_type='0', *, columns=None, rows=None):
+    profile = get_chart_profile(chart_type)
+    if chart_size is None:
+        chart_size = profile.chart_size
+    if columns is None:
+        columns = profile.columns
+    if rows is None:
+        rows = profile.rows
     chart_width, chart_height = chart_size
     if chart_width <= 0 or chart_height <= 0:
         raise ValueError("Rectified chart dimensions must be positive.")
     sample_size = max(1, int(patch_size))
-    center_u, center_v = chart_patch_uv(slot)
+    center_u, center_v = chart_patch_uv(slot, columns=columns, rows=rows)
     half_u = sample_size / (2.0 * chart_width)
     half_v = sample_size / (2.0 * chart_height)
     chart_corners = np.array((
@@ -564,12 +667,22 @@ def sample_warped_chart_patch(
     slot,
     patch_size,
     *,
-    chart_size=CHART_SIZE,
+    chart_size=None,
+    chart_type='0',
+    columns=None,
+    rows=None,
     panorama_projection=None,
 ):
+    profile = get_chart_profile(chart_type)
+    if chart_size is None:
+        chart_size = profile.chart_size
+    if columns is None:
+        columns = profile.columns
+    if rows is None:
+        rows = profile.rows
     chart_width, chart_height = chart_size
     sample_size = max(1, int(patch_size))
-    center_u, center_v = chart_patch_uv(slot)
+    center_u, center_v = chart_patch_uv(slot, columns=columns, rows=rows)
     offsets = np.arange(sample_size, dtype=np.float64) + 0.5 - sample_size * 0.5
     grid_u, grid_v = np.meshgrid(
         center_u + offsets / chart_width,
@@ -594,8 +707,13 @@ def sample_warped_chart_patch(
 def calculate_matrix_result(input_samples, ref_samples, *, debug=False):
     input_samples = np.asarray(input_samples, dtype=np.float64)
     ref_samples = np.asarray(ref_samples, dtype=np.float64)
-    if input_samples.shape != (24, 3) or ref_samples.shape != (24, 3):
-        raise CalibrationError("Calibration requires two 24x3 sample arrays.")
+    if (
+        input_samples.ndim != 2
+        or input_samples.shape[1] != 3
+        or input_samples.shape != ref_samples.shape
+        or input_samples.shape[0] < 3
+    ):
+        raise CalibrationError("Calibration requires matching Nx3 sample arrays.")
     if not np.all(np.isfinite(input_samples)) or not np.all(np.isfinite(ref_samples)):
         raise CalibrationError("Calibration samples contain non-finite values.")
     if not np.any(input_samples) or not np.any(ref_samples):

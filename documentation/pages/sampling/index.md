@@ -4,7 +4,7 @@
 
 [Image Editor](https://docs.blender.org/manual/en/latest/editors/image/index.html) > Sidebar > **MacBlend**
 
-MacBlend samples the 24 patches of a 6-by-4 Macbeth ColorChecker from Blender's decoded, scene-linear image data. The image [**Color Space**](https://docs.blender.org/manual/en/latest/editors/image/image_settings.html#bpy-types-colormanagedinputcolorspacesettings-name) must therefore describe the source file correctly.
+MacBlend samples the 24 patches of the selected ColorChecker Classic (after 2014) or SpyderCheckr 24 model from Blender's decoded, scene-linear image data. The image [**Color Space**](https://docs.blender.org/manual/en/latest/editors/image/image_settings.html#bpy-types-colormanagedinputcolorspacesettings-name) must therefore describe the source file correctly.
 
 ## Chart Overlay
 
@@ -17,7 +17,10 @@ Chart overlay aligned to the outer corners of a Macbeth ColorChecker.
 ```
 
 **Show Overlay**
-: Shows the Macbeth chart overlay in the Image Editor. It is initialized in the center of the image with a patch size of 40 by 40 pixels. Later toggles preserve edits.
+: Shows the selected chart model's overlay in the Image Editor. It is initialized in the center of the image with a patch size of 40 by 40 pixels. Later toggles preserve edits.
+
+**Chart Type**
+: Selects **ColorChecker Classic (after 2014)** or **SpyderCheckr 24**. Changing this dropdown switches the overlay order and sampling positions to match the selected physical chart while preserving the current overlay alignment.
 
 **Patch Size**
 : Sets the size of the patches used for sampling, in image pixels. When **Sample Chart** is used, MacBlend averages the pixels inside each patch. Larger patches average more pixels, but must remain inside the chart's colored areas.
@@ -26,7 +29,7 @@ Chart overlay aligned to the outer corners of a Macbeth ColorChecker.
 : Controls the opacity of the color swatches shown inside the chart overlay. Before the image has been sampled, the swatches show built-in sRGB reference colors; afterward, they show the stored sampled colors. This setting affects only the overlay display, not the sampled values.
 
 **Flip Horizontal**, **Flip Vertical**
-: Reverses the patch order to match the chart orientation.
+: Reverses the overlay orientation when the photographed chart is rotated or mirrored.
 
 **Center Overlay**
 : Re-initializes the chart overlay in the current Image Editor view. **Patch Size** is recalculated as a result.

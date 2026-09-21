@@ -251,9 +251,17 @@ def detect_working_space_gamut():
     )
 
 
-def _build_reference_samples(context, selected_target):
+def get_image_chart_type_label(image):
+    if not image or not getattr(image, 'mb_sample_data', None):
+        return "Unknown"
+    chart_type = getattr(image.mb_sample_data, 'chart_type', '0')
+    profile = core.get_chart_profile(chart_type)
+    return profile.label
+
+
+def _build_reference_samples(context, selected_target, chart_type='0'):
     try:
-        return core.build_reference_values(selected_target).astype(np.float32)
+        return core.build_reference_values(selected_target, chart_type=chart_type).astype(np.float32)
     except ValueError as exc:
         raise ValueError(f"Failed to build target reference '{selected_target}': {exc}") from exc
 
@@ -419,44 +427,51 @@ def _prepare_calibration_data(
             self.report({'ERROR'}, "This panel only works in the Shader or Compositor editor.")
             return None, None, None, None, None
 
+    source_chart_type = getattr(image.mb_sample_data, 'chart_type', '0')
+    profile = core.get_chart_profile(source_chart_type)
+
     source_samples = _ordered_image_samples(image)
     if source_samples is None:
-        self.report({'ERROR'}, "The image samples do not form a complete 24-patch Macbeth set.")
+        self.report({'ERROR'}, f"The image samples do not form a complete 24-patch {profile.label} set.")
         return None, None, None, None, None
 
     if settings.use_reference_target:
         selected_target = settings.target_colorspace or "REC709"
         try:
-            target_samples = _build_reference_samples(context, selected_target)
+            target_samples = _build_reference_samples(context, selected_target, chart_type=source_chart_type)
         except ValueError as exc:
             self.report({'ERROR'}, str(exc))
             return None, None, None, None, None
-        target_description = f"reference '{selected_target}'"
+        target_description = f"reference '{selected_target}' ({profile.label})"
     else:
         target_image = settings.sample_target_image
         if target_image is None:
             self.report({'ERROR'}, "No saved target image selected.")
             return None, None, None, None, None
+        target_chart_type = getattr(target_image.mb_sample_data, 'chart_type', '0')
+        if source_chart_type != target_chart_type:
+            source_label = get_image_chart_type_label(image)
+            target_label = get_image_chart_type_label(target_image)
+            self.report(
+                {'ERROR'},
+                f"Source image chart type ('{source_label}') does not match target image chart type ('{target_label}').",
+            )
+            return None, None, None, None, None
         target_samples = _ordered_image_samples(target_image)
         if target_samples is None:
-            self.report({'ERROR'}, "The target image samples do not form a complete 24-patch Macbeth set.")
+            self.report({'ERROR'}, f"The target image samples do not form a complete 24-patch {profile.label} set.")
             return None, None, None, None, None
-        target_description = f"image '{target_image.name}'"
+        target_description = f"image '{target_image.name}' ({profile.label})"
 
-    standard_patch_names = (
-        "Dark Skin", "Light Skin", "Blue Sky", "Foliage", "Blue Flower", "Bluish Green",
-        "Orange", "Purplish Blue", "Moderate Red", "Purple", "Yellow Green", "Orange Yellow",
-        "Blue", "Green", "Red", "Yellow", "Magenta", "Cyan",
-        "White 9.5", "Neutral 8", "Neutral 6.5", "Neutral 5", "Neutral 3.5", "Black 2",
-    )
+    standard_patch_names = profile.patch_names
     debug_logging = _debug_logging_enabled(context)
 
     if debug_logging:
-        print("[MacBlend] Source samples in Macbeth slot order:", flush=True)
+        print(f"[MacBlend] Source samples in {profile.label} slot order:", flush=True)
         for idx, value in enumerate(source_samples):
             patch_name = standard_patch_names[idx] if idx < len(standard_patch_names) else f"slot_{idx}"
             print(f"  slot[{idx}] ({patch_name}) = {tuple(float(v) for v in value)}", flush=True)
-        print(f"[MacBlend] Target samples from {target_description} (standard Macbeth order):", flush=True)
+        print(f"[MacBlend] Target samples from {target_description}:", flush=True)
         for idx, value in enumerate(target_samples):
             print(f"  target[{idx}] ({standard_patch_names[idx]}) = {tuple(float(v) for v in value)}", flush=True)
 
@@ -470,7 +485,8 @@ def _prepare_calibration_data(
     matrix_input = source_samples.copy()
 
     if settings.normalize_calibration:
-        neutral_idx = 21
+        neutral_idx = profile.neutral_patch_index
+        neutral_patch_name = standard_patch_names[neutral_idx] if neutral_idx < len(standard_patch_names) else f"slot_{neutral_idx}"
         if neutral_idx >= len(source_samples) or neutral_idx >= len(target_samples):
             self.report({'ERROR'}, "Neutral patch index is out of bounds for normalization.")
             return None, None, None, None, None
@@ -481,14 +497,14 @@ def _prepare_calibration_data(
         ref_luma = float(np.dot(ref_grey, core.LUMA_COEFFS_REC709))
 
         if debug_logging:
-            print(f"[MacBlend] Neutral patch idx={neutral_idx} src_grey={tuple(float(v) for v in src_grey)} src_luma={src_luma}", flush=True)
-            print(f"[MacBlend] Neutral patch idx={neutral_idx} ref_grey={tuple(float(v) for v in ref_grey)} ref_luma={ref_luma}", flush=True)
+            print(f"[MacBlend] Neutral patch idx={neutral_idx} ({neutral_patch_name}) src_grey={tuple(float(v) for v in src_grey)} src_luma={src_luma}", flush=True)
+            print(f"[MacBlend] Neutral patch idx={neutral_idx} ({neutral_patch_name}) ref_grey={tuple(float(v) for v in ref_grey)} ref_luma={ref_luma}", flush=True)
 
         if not math.isfinite(src_luma) or src_luma <= 1e-7:
-            self.report({'ERROR'}, "Source Neutral 5 luminance must be finite and greater than zero for normalization.")
+            self.report({'ERROR'}, f"Source {neutral_patch_name} luminance must be finite and greater than zero for normalization.")
             return None, None, None, None, None
         if not math.isfinite(ref_luma) or ref_luma <= 1e-7:
-            self.report({'ERROR'}, "Target Neutral 5 luminance must be finite and greater than zero for normalization.")
+            self.report({'ERROR'}, f"Target {neutral_patch_name} luminance must be finite and greater than zero for normalization.")
             return None, None, None, None, None
 
         normalization_factor = ref_luma / src_luma
@@ -1238,6 +1254,9 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
         layout = self.layout
         settings = getattr(context.scene, 'macblend_calibrator_settings', None)
         layout.prop(settings, 'sample_source_image', text='Image')
+        if settings.sample_source_image is not None:
+            source_chart_label = get_image_chart_type_label(settings.sample_source_image)
+            layout.label(text=f"Chart: {source_chart_label}", icon='INFO')
         layout.prop(settings, 'use_reference_target')
         if settings.use_reference_target:
             layout.prop(settings, 'target_colorspace', text='Target')
@@ -1252,6 +1271,9 @@ class MB_PT_CalibrationPanel(bpy.types.Panel):
                     row.label(text="Couldn't detect target gamut from scene", icon='CANCEL')
         else:
             layout.prop(settings, 'sample_target_image', text='Target')
+            if settings.sample_target_image is not None:
+                target_chart_label = get_image_chart_type_label(settings.sample_target_image)
+                layout.label(text=f"Chart: {target_chart_label}", icon='INFO')
         layout.prop(settings, 'normalize_calibration', text='Normalize')
         layout.prop(settings, 'create_exposure_node', text='Create Exposure Node')
         layout.prop(settings, 'node_name', text='Node Name')
